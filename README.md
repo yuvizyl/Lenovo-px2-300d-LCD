@@ -8,11 +8,11 @@ LenovoEMC px2-300d 前面板 **128×64 单色 LCD（含背光、Select / Scroll 
 **可在现代内核上动态加载（insmod）的独立内核模块**，并配套零第三方依赖的
 Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 
-> 已在 Ubuntu（kernel 6.8.0-138-generic）上完成模块编译，硬件寄存器时序与
+> 已在 Debian13 上完成模块编译，硬件寄存器时序与
 > 原厂驱动逐行一致。
 ## 前面板状态：
 
-> sudo python3 workspace/python/screens/screen_ip_storage.py
+> sudo python3 workspace/lcm_user/screens/screen_ip_storage.py
 
 ![screen_ip_storage 实拍前面板效果](readfile/ShowImage/jpeg1.jpg)
 
@@ -25,7 +25,7 @@ Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 - **动态加载**：单个 `.ko`，无需重编内核；在非 px2-300d 机器上会安全拒绝加载
 - **Python 接口层**：硬件能力与业务操作分离，内置 5×7 点阵字库与帧缓存
 - **节能状态屏示例**：IP / ZFS 容量显示、相同帧不刷新、10 秒无变化自动关背光、
-  按任意键唤醒
+  按任意键唤醒（提供 Python 与 C 两个等价实现）
 - 仅依赖 Linux 内核头文件与 Python 标准库（Python 2.7 / 3 通用库接口） 
 
 ## 硬件说明
@@ -59,7 +59,7 @@ px2_300d_lcd/
     │   ├── load.sh               编译 + insmod 一键脚本
     │   └── unload.sh             rmmod 卸载脚本
     │
-    └── python/
+    └── lcm_user/
         ├── px2lcm.py                           通用硬件接口层（唯一操作 /dev/lcm 的模块）
         ├── examples/                           基础与回调示例
         │   ├── demo_on.py / demo_off.py        开屏 / 关屏
@@ -67,7 +67,12 @@ px2_300d_lcd/
         │   ├── demo_stripe.py                  间隔 1 亮 1 黑
         │   └── demo_callback.py                按键回调（推荐写法）
         └── screens/
-            └── screen_ip_storage.py            IP / ZFS 状态屏（实际应用）
+            ├── screen_ip_storage.py         IP / ZFS 状态屏（Python 实际应用）
+            └── screen_ip_storage_c/         同一状态屏的 C 语言实现
+                ├── screen_ip_storage.c
+                ├── glyph.h                  5x7 ASCII 点阵字库
+                ├── lcm_uapi.h               ioctl 接口定义（副本）
+                └── Makefile
 ```
 
 ## 快速开始
@@ -99,7 +104,7 @@ sh unload.sh                              # 卸载（自动息屏）
 ### 2. 运行 Python 示例
 
 ```sh
-cd workspace/python
+cd workspace/lcm_user
 sudo python3 examples/demo_white.py        # 全亮
 sudo python3 examples/demo_stripe.py       # 竖条纹
 sudo python3 examples/demo_callback.py     # 常驻：按 Select/Scroll 联动屏幕，Ctrl-C 退出
@@ -107,7 +112,7 @@ sudo python3 examples/demo_callback.py     # 常驻：按 Select/Scroll 联动�
 
 ### 3. 运行 IP / 存储状态屏
 
-编辑 [screen_ip_storage.py](workspace/python/screens/screen_ip_storage.py)
+编辑 [screen_ip_storage.py](workspace/lcm_user/screens/screen_ip_storage.py)
 开头的常量后运行：
 
 ```python
@@ -123,9 +128,20 @@ sudo python3 screens/screen_ip_storage.py
 界面（`E1/E2` 标签 + 网卡 IP + up 状态 + ZFS 池 ALLOC/SIZE 实心进度条），
 画面 10 秒无变化自动关背光，按任意键重新点亮。
 
+同屏还有一个**功能完全等价的 C 语言版本**（直接 ioctl，无需 Python）：
+
+```sh
+cd workspace/lcm_user/screens/screen_ip_storage_c
+make
+sudo ./screen_ip_storage
+```
+
+C 版同样在文件开头用宏定义 `IP1DEV / IP2DEV / STORAGE_FS / STORAGE_POOL /
+STORAGE_SHOWNAME / ZPOOL_CMD / REFRESH_INTERVAL / IDLE_OFF_SECONDS` 供修改。
+
 ## 编程模型
 
-通用接口 [px2lcm.py](workspace/python/px2lcm.py) 把"硬件能力"与"业务操作"分开：
+通用接口 [px2lcm.py](workspace/lcm_user/px2lcm.py) 把"硬件能力"与"业务操作"分开：
 
 ```python
 from px2lcm import FrontPanel

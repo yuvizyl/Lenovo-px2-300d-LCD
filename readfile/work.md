@@ -384,6 +384,11 @@ readfile/
     5 秒刷新；另带节能逻辑：帧缓存去重（相同帧不下发）、画面连续
     `IDLE_OFF_SECONDS`（默认 10 秒）无变化自动关背光，按 Select/Scroll
     任意一键重新点亮并重置 10 秒计时（背光关闭期间显存仍照常更新）。
+  - `screens/screen_ip_storage_c/`：上述状态屏的 **C 语言等价实现**
+    （`screen_ip_storage.c` + 复制的 `lcm_uapi.h` + Makefile）：直接用
+    ioctl 操作 `/dev/lcm`、`/dev/wixbtn`（SIOCGIFADDR / SIOCGIFFLAGS 查网卡、
+    `popen("/sbin/zpool list -Hp -o alloc,size")` 查容量、`select` 等键），
+    常量同为文件开头的宏，`make && sudo ./screen_ip_storage` 运行。
 
 ### 11.3 真机使用
 
