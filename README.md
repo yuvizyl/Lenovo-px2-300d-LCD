@@ -46,7 +46,10 @@ px2_300d_lcd/
 ├── README.md                     本文件
 ├── readfile/
 │   ├── work.md                   ★ 原厂补丁逆向调研（全部技术细节，建议先读）
-│   └── b2a.patch                 LenovoEMC 官方开源套件中的原始内核补丁
+|   ├── ShowImage/
+│   │   └── jpeg1.jpg             实拍前面板效果
+│   ├── b2a.patch                 LenovoEMC 官方开源套件中的原始内核补丁
+|   └── display.pptx              前面板显示内容的需求稿（把ppt转成png发给ai让帮忙完成）
 │
 └── workspace/
     ├── lcm_driver/               独立可加载内核模块
@@ -57,14 +60,14 @@ px2_300d_lcd/
     │   └── unload.sh             rmmod 卸载脚本
     │
     └── python/
-        ├── px2lcm.py             通用硬件接口层（唯一操作 /dev/lcm 的模块）
-        ├── examples/             基础与回调示例
-        │   ├── demo_on.py / demo_off.py     开屏 / 关屏
-        │   ├── demo_white.py / demo_black.py 全亮 / 全黑
-        │   ├── demo_stripe.py               间隔 1 亮 1 黑
-        │   └── demo_callback.py             按键回调（推荐写法）
+        ├── px2lcm.py                           通用硬件接口层（唯一操作 /dev/lcm 的模块）
+        ├── examples/                           基础与回调示例
+        │   ├── demo_on.py / demo_off.py        开屏 / 关屏
+        │   ├── demo_white.py / demo_black.py   全亮 / 全黑
+        │   ├── demo_stripe.py                  间隔 1 亮 1 黑
+        │   └── demo_callback.py                按键回调（推荐写法）
         └── screens/
-            └── screen_ip_storage.py         IP / ZFS 状态屏（实际应用）
+            └── screen_ip_storage.py            IP / ZFS 状态屏（实际应用）
 ```
 
 ## 快速开始
