@@ -36,12 +36,16 @@
  *      0xC0 = off, 0xD5 = on, 0xFF = blink.
  *
  *   3. Two LCD buttons (Select / Scroll) -> misc device /dev/wixbtn
- *      They sit on Intel ICH8/PCH GPIO2/GPIO3 routed to ACPI GPE18/GPE19
- *      (same hardware path as b2a/sci.c). Edge detect uses the PCH GPIO
- *      input inversion (INV) polarity trick; one WIX_BTN_LCM_SELECT(4) /
- *      WIX_BTN_LCM_SCROLL(5) event is reported per key press.
- *      Usable with blocking/non-blocking ioctl, plain read(2) (4-byte
- *      little-endian ints), and poll(2).
+ *      They sit on Intel ICH8/PCH GPIO2/GPIO3. The original b2a/sci.c
+ *      detected edges via ACPI GPE18/GPE19 + the GPIO INV polarity trick,
+ *      but on modern kernels a level-triggered GPE that does not deassert
+ *      quickly enough triggers the ACPICA GPE-storm protection, which
+ *      disables the GPE permanently (first key works, later keys dead until
+ *      module reload). This driver therefore polls the GPIO level register
+ *      with a debouncing kernel timer instead - it cannot storm and survives
+ *      userspace restarts. One WIX_BTN_LCM_SELECT(4) / WIX_BTN_LCM_SCROLL(5)
+ *      event is reported per key press. Usable with blocking/non-blocking
+ *      ioctl, plain read(2) (4-byte little-endian ints), and poll(2).
  *
  * Build/load:
  *   make
@@ -68,7 +72,17 @@
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 #include <linux/pci.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/version.h>
 #include <linux/acpi.h>
+
+/* timer API renamed in kernel 6.15: del_timer_sync() -> timer_delete_sync() */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+#define wix_timer_delete_sync(t)	timer_delete_sync(t)
+#else
+#define wix_timer_delete_sync(t)	del_timer_sync(t)
+#endif
 #if IS_ENABLED(CONFIG_BACKLIGHT_CLASS_DEVICE)
 #include <linux/fb.h>
 #include <linux/backlight.h>
@@ -121,27 +135,23 @@
 #define BANK_SEL		0x004E
 static const unsigned char bl_regval[3] = { 0xC0, 0xD5, 0xFF };
 
-/* ---- buttons: ICH8/PCH GPIO + ACPI GPE routing ---- */
+/* ---- buttons: ICH8/PCH GPIO, polled by a debouncing kernel timer ---- */
 #define LPC_VENDORID		0x8086
 #define LPC_DEVICEID		0x2918	/* Intel ICH8 LPC */
-#define LPC_OFFSET_PMBASE	0x40
 #define LPC_OFFSET_GPIOBASE	0x48
-#define LPC_OFFSET_GPE_ROUTE	0xB8
 
 #define PCH_GPIO_USE_SEL	0x00
 #define PCH_GPIO_IO_SEL		0x04
 #define PCH_GPIO_LVL		0x0C
 #define PCH_GPIO_INV		0x2C
 
-#define ACPI_GPE0_STS		0x20
-#define ACPI_GPE0_EN		0x28
-#define ACPI_PM1_CNT		0x04
-
-/* LCD buttons: PCH GPIO index and the ACPI GPE number (0x10 + index) */
+/* LCD buttons: PCH GPIO index */
 #define BTN_SEL_GPIO_IDX	2
 #define BTN_SCR_GPIO_IDX	3
-#define BTN_SEL_GPE		(0x10 + BTN_SEL_GPIO_IDX)	/* 18 */
-#define BTN_SCR_GPE		(0x10 + BTN_SCR_GPIO_IDX)	/* 19 */
+
+/* Polling/debounce timing */
+#define BTN_POLL_MS		20	/* timer period */
+#define BTN_DEBOUNCE_MS		60	/* level must be stable this long */
 
 /* Module parameters */
 static unsigned short sioaddr = SIO_ADDR_DEFAULT;
@@ -645,13 +655,16 @@ static long lcmdev_ioctl(struct file *filp, unsigned int cmd,
 #endif
 		return 0;
 
-	case WIX_LCM_IOC_BL_GET:
+	case WIX_LCM_IOC_BL_GET: {
+		int hw = backlight_hw_get();	/* 读硬件实际状态 */
+
 		mutex_lock(&bl_lock);
-		bl = backlight_state;
+		bl = (hw >= 0) ? hw : backlight_state;
 		mutex_unlock(&bl_lock);
 		if (copy_to_user((int __user *)arg, &bl, sizeof(bl)))
 			return -EFAULT;
 		return 0;
+	}
 
 	case IOCTL_DISPLAY_COMMAND:
 		if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
@@ -786,43 +799,46 @@ static const struct backlight_ops wix_backlight_ops = {
 #endif
 
 /* ======================================================================= */
-/* /dev/wixbtn - the two LCD buttons (Select / Scroll) over ACPI GPE        */
+/* /dev/wixbtn - the two LCD buttons (Select / Scroll), polled PCH GPIO    */
 /* ======================================================================= */
 
-#if IS_ENABLED(CONFIG_ACPI) && IS_ENABLED(CONFIG_PCI)
+#if IS_ENABLED(CONFIG_PCI)
 
 struct btn_event_node {
 	struct list_head	list;
 	int			code;	/* WIX_BTN_LCM_* */
 };
 
-struct wix_gpe_ctx {
-	u32			gpe;
+struct wix_button {
 	int			gpio_idx;	/* PCH GPIO index 2/3 */
 	int			code;		/* reported key code 4/5 */
 	const char		*name;
+	/* debounce state, all updated only from the poll timer */
+	int			idle_level;	/* level while not pressed (sampled at init) */
+	int			last_raw;	/* last raw sample */
+	int			stable;		/* last debounced (stable) level */
+	unsigned long		stable_jiffies;/* when current run of equal samples began */
 };
 
 static LIST_HEAD(btn_events);
 static DEFINE_SPINLOCK(btn_event_lock);
 static DECLARE_WAIT_QUEUE_HEAD(btn_wait);
 
-static unsigned int acpi_pm_base;
 static unsigned int pch_gpio_base;
-static struct wix_gpe_ctx btn_sel_ctx = {
-	.gpe = BTN_SEL_GPE, .gpio_idx = BTN_SEL_GPIO_IDX,
+static struct timer_list btn_timer;
+static bool btn_timer_on;
+
+static struct wix_button button_sel = {
+	.gpio_idx = BTN_SEL_GPIO_IDX,
 	.code = WIX_BTN_LCM_SELECT, .name = "LCM Select"
 };
-static struct wix_gpe_ctx btn_scr_ctx = {
-	.gpe = BTN_SCR_GPE, .gpio_idx = BTN_SCR_GPIO_IDX,
+static struct wix_button button_scr = {
+	.gpio_idx = BTN_SCR_GPIO_IDX,
 	.code = WIX_BTN_LCM_SCROLL, .name = "LCM Scroll"
 };
-static struct wix_gpe_ctx *installed_gpe[2] = {
-	&btn_sel_ctx, &btn_scr_ctx
-};
-static int gpe_installed_count;
+static struct wix_button *const buttons[2] = { &button_sel, &button_scr };
 
-/* Callable from hard IRQ (ACPI GPE dispatch); only I/O ports + atomics. */
+/* Callable from timer softirq; only I/O ports + GFP_ATOMIC allocs. */
 static void btn_event_enqueue(int code)
 {
 	struct btn_event_node *node;
@@ -844,40 +860,54 @@ static void btn_event_enqueue(int code)
 }
 
 /*
- * Raw ACPI GPE handler. Same hardware algorithm as b2a/sci.c:
- * every interrupt toggles the PCH GPIO input inversion bit for that pin,
- * which flips the sensed level and de-asserts the level-triggered GPE.
- * The pin starts inverted (INV bit set at init); on the press edge the
- * bit is found set -> cleared and the button code reported; the release
- * edge finds it clear -> sets it again without reporting anything.
- * GPE status is write-1-to-clear afterwards.
+ * Poll timer: read the two GPIO level bits, software-debounce them and
+ * report one event per key press (the transition away from the idle level).
+ * Polling replaces the GPE/INV scheme entirely - no level-triggered GPE
+ * means no GPE storm, and this keeps working regardless of userspace.
  */
-static u32 wix_gpe_handler(acpi_handle gpe_device, u32 gpe_number, void *ctx)
+static void btn_poll_timer(struct timer_list *unused)
 {
-	struct wix_gpe_ctx *button = ctx;
-	u32 status, inv;
-	int idx = button->gpio_idx;
+	u32 lvl;
+	int i;
 
-	status = inl(acpi_pm_base + ACPI_GPE0_STS);
-	if (((status >> (idx + 16)) & 0x01) == 0)
-		return ACPI_INTERRUPT_NOT_HANDLED;
+	(void)unused;
+	if (!pch_gpio_base)
+		goto rearm;
 
-	inv = inl(pch_gpio_base + PCH_GPIO_INV);
-	if ((inv >> idx) & 0x01) {
-		/* press edge: inversion was set -> clear, report click */
-		outl(inv & ~(1u << idx), pch_gpio_base + PCH_GPIO_INV);
-		btn_event_enqueue(button->code);
-		lcm_dbg("%s button pressed (GPE %u)\n", button->name, gpe_number);
-	} else {
-		/* release edge: re-arm inversion, no event */
-		outl(inv | (1u << idx), pch_gpio_base + PCH_GPIO_INV);
-		lcm_dbg("%s button released (GPE %u)\n", button->name, gpe_number);
+	lvl = inl(pch_gpio_base + PCH_GPIO_LVL);
+
+	for (i = 0; i < ARRAY_SIZE(buttons); i++) {
+		struct wix_button *b = buttons[i];
+		int raw = (lvl >> b->gpio_idx) & 0x01;
+		unsigned long now = jiffies;
+
+		if (raw != b->last_raw) {
+			b->last_raw = raw;
+			b->stable_jiffies = now;
+			/* not stable yet */
+			continue;
+		}
+
+		if (raw == b->stable)
+			continue;	/* already at this stable level */
+
+		if (time_before(now, b->stable_jiffies +
+			       msecs_to_jiffies(BTN_DEBOUNCE_MS)))
+			continue;	/* wait until it stays stable long enough */
+
+		/* accept the new stable level */
+		b->stable = raw;
+		if (raw != b->idle_level) {
+			btn_event_enqueue(b->code);
+			lcm_dbg("%s button pressed (polled GPIO%d)\n",
+				b->name, b->gpio_idx);
+		}
 	}
 
-	/* clear GPE status (write 1 to clear) */
-	outl(1u << (idx + 16), acpi_pm_base + ACPI_GPE0_STS);
-
-	return ACPI_INTERRUPT_HANDLED;
+rearm:
+	if (btn_timer_on)
+		mod_timer(&btn_timer,
+			  jiffies + msecs_to_jiffies(BTN_POLL_MS));
 }
 
 static int btn_events_pending(void)
@@ -1018,17 +1048,17 @@ static void wixbtn_cleanup_events(void)
 }
 
 /*
- * Wire the two LCD buttons to ACPI GPEs, following the proven b2a/sci.c
- * hardware sequence (restricted to GPIO2/GPIO3 -> GPE18/GPE19; power and
- * reset GPEs are intentionally left untouched).
+ * Configure the two LCD buttons as plain PCH GPIO inputs and start the
+ * debouncing poll timer. No ACPI GPE is touched, which removes the
+ * GPE-storm failure mode of the old edge detection.
  */
 static int wix_buttons_init(void)
 {
 	struct pci_dev *pcidev;
-	u32 pmbase = 0, gpiobase = 0, routing;
+	u32 gpiobase = 0;
 	u32 pin_mask = (1u << BTN_SEL_GPIO_IDX) | (1u << BTN_SCR_GPIO_IDX);
-	u32 gpe_mask = pin_mask << 16;
-	int i, ret;
+	u32 lvl;
+	int ret, i;
 
 	pcidev = pci_get_device(LPC_VENDORID, LPC_DEVICEID, NULL);
 	if (!pcidev) {
@@ -1037,95 +1067,58 @@ static int wix_buttons_init(void)
 		return -ENODEV;
 	}
 
-	ret = pci_read_config_dword(pcidev, LPC_OFFSET_PMBASE, &pmbase);
-	if (ret || !(pmbase & 0x01)) {
-		pr_warn("wixlcm: ACPI PM base unavailable, buttons disabled\n");
-		goto out_put_pci;
-	}
-	acpi_pm_base = pmbase & 0x0000FF80u;
-
 	ret = pci_read_config_dword(pcidev, LPC_OFFSET_GPIOBASE, &gpiobase);
 	if (ret || !(gpiobase & 0x01)) {
 		pr_warn("wixlcm: PCH GPIO base unavailable, buttons disabled\n");
-		goto out_put_pci;
+		pci_dev_put(pcidev);
+		return -ENODEV;
 	}
 	pch_gpio_base = gpiobase & 0x0000FF80u;
+	pci_dev_put(pcidev);
 
-	/* Route GPIO2/GPIO3 to GPI (PCI config dword 0xB8, 2 bits each -> 2). */
-	ret = pci_read_config_dword(pcidev, LPC_OFFSET_GPE_ROUTE, &routing);
-	if (ret == 0) {
-		routing &= ~((3u << (BTN_SEL_GPIO_IDX * 2)) |
-			     (3u << (BTN_SCR_GPIO_IDX * 2)));
-		routing |= (2u << (BTN_SEL_GPIO_IDX * 2)) |
-			   (2u << (BTN_SCR_GPIO_IDX * 2));
-		pci_write_config_dword(pcidev, LPC_OFFSET_GPE_ROUTE, routing);
-	}
-
-	/* PCH GPIO: select GPIO function, inputs, start inverted, low. */
+	/* GPIO function + inputs; disable input inversion (read raw level). */
 	outl(inl(pch_gpio_base + PCH_GPIO_USE_SEL) | pin_mask,
 	     pch_gpio_base + PCH_GPIO_USE_SEL);
 	outl(inl(pch_gpio_base + PCH_GPIO_IO_SEL) | pin_mask,
 	     pch_gpio_base + PCH_GPIO_IO_SEL);
-	outl(inl(pch_gpio_base + PCH_GPIO_INV) | pin_mask,
+	outl(inl(pch_gpio_base + PCH_GPIO_INV) & ~pin_mask,
 	     pch_gpio_base + PCH_GPIO_INV);
-	outl(inl(pch_gpio_base + PCH_GPIO_LVL) & ~pin_mask,
-	     pch_gpio_base + PCH_GPIO_LVL);
 
-	/* clear any pending GPE status, select SCI mode in PM1_CNT */
-	outl(gpe_mask, acpi_pm_base + ACPI_GPE0_STS);
-	outl(inl(acpi_pm_base + ACPI_PM1_CNT) | 0x01,
-	     acpi_pm_base + ACPI_PM1_CNT);
+	/* seed debounce state from the current (assumed not pressed) level */
+	lvl = inl(pch_gpio_base + PCH_GPIO_LVL);
+	for (i = 0; i < ARRAY_SIZE(buttons); i++) {
+		int l = (lvl >> buttons[i]->gpio_idx) & 0x01;
 
-	/* install raw GPE handlers, then enable */
-	for (i = 0; i < ARRAY_SIZE(installed_gpe); i++) {
-		acpi_status ast;
-
-		ast = acpi_install_gpe_handler(NULL, installed_gpe[i]->gpe,
-					       ACPI_GPE_LEVEL_TRIGGERED,
-					       wix_gpe_handler,
-					       installed_gpe[i]);
-		if (ast != AE_OK) {
-			pr_warn("wixlcm: failed to install GPE %u handler: %d\n",
-				installed_gpe[i]->gpe, ast);
-			goto err_remove_handlers;
-		}
-		gpe_installed_count++;
-
-		ast = acpi_enable_gpe(NULL, installed_gpe[i]->gpe);
-		if (ast != AE_OK) {
-			pr_warn("wixlcm: failed to enable GPE %u: %d\n",
-				installed_gpe[i]->gpe, ast);
-			goto err_remove_handlers;
-		}
+		buttons[i]->idle_level = l;
+		buttons[i]->last_raw = l;
+		buttons[i]->stable = l;
+		buttons[i]->stable_jiffies = jiffies;
 	}
 
 	ret = misc_register(&wixbtndev);
 	if (ret) {
 		pr_err("wixlcm: misc_register(/dev/wixbtn) failed: %d\n", ret);
-		goto err_remove_handlers;
+		pch_gpio_base = 0;
+		return ret;
 	}
 	wixbtn_registered = true;
 
-	pci_dev_put(pcidev);
-	pr_info("wixlcm: LCD buttons ready on /dev/%s (Select=GPE%u, Scroll=GPE%u)\n",
-		BTN_DEVICE_NAME, BTN_SEL_GPE, BTN_SCR_GPE);
-	return 0;
+	timer_setup(&btn_timer, btn_poll_timer, 0);
+	btn_timer_on = true;
+	mod_timer(&btn_timer, jiffies + msecs_to_jiffies(BTN_POLL_MS));
 
-err_remove_handlers:
-	for (i = 0; i < gpe_installed_count; i++) {
-		acpi_disable_gpe(NULL, installed_gpe[i]->gpe);
-		acpi_remove_gpe_handler(NULL, installed_gpe[i]->gpe,
-					wix_gpe_handler);
-	}
-	gpe_installed_count = 0;
-out_put_pci:
-	pci_dev_put(pcidev);
-	return -ENODEV;
+	pr_info("wixlcm: LCD buttons ready on /dev/%s (polled PCH GPIO%d/GPIO%d, %dms)\n",
+		BTN_DEVICE_NAME, BTN_SEL_GPIO_IDX, BTN_SCR_GPIO_IDX,
+		BTN_POLL_MS);
+	return 0;
 }
 
 static void wix_buttons_exit(void)
 {
-	int i;
+	if (btn_timer_on) {
+		btn_timer_on = false;
+		wix_timer_delete_sync(&btn_timer);
+	}
 
 	if (wixbtn_registered) {
 		misc_deregister(&wixbtndev);
@@ -1133,22 +1126,15 @@ static void wix_buttons_exit(void)
 	}
 
 	wake_up_interruptible(&btn_wait);
-
-	for (i = 0; i < gpe_installed_count; i++) {
-		acpi_disable_gpe(NULL, installed_gpe[i]->gpe);
-		acpi_remove_gpe_handler(NULL, installed_gpe[i]->gpe,
-					wix_gpe_handler);
-	}
-	gpe_installed_count = 0;
-
 	wixbtn_cleanup_events();
+	pch_gpio_base = 0;
 }
 
-#else  /* !CONFIG_ACPI || !CONFIG_PCI */
+#else  /* !CONFIG_PCI */
 
 static int wix_buttons_init(void)
 {
-	pr_warn("wixlcm: kernel built without ACPI/PCI, buttons disabled\n");
+	pr_warn("wixlcm: kernel built without PCI, buttons disabled\n");
 	return -ENODEV;
 }
 
@@ -1156,7 +1142,7 @@ static void wix_buttons_exit(void)
 {
 }
 
-#endif /* CONFIG_ACPI && CONFIG_PCI */
+#endif /* CONFIG_PCI */
 
 /* ======================================================================= */
 /* module init/exit                                                         */

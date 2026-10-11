@@ -347,12 +347,17 @@ readfile/
    控制途径：ioctl `0xDD0A/0xDD0B`、`/sys/class/misc/lcm/backlight`、
    标准 `/sys/class/backlight/wixlcm/`（有 CONFIG 时）；模块参数
    `initial_backlight`。
-3. **Select/Scroll 两键**（源自 `sci.c`）：PCH GPIO2/3 → PCI 0xB8 路由
-   → GPE18/19，INV 翻转边沿检测，按下上报 4/5；misc 设备 `/dev/wixbtn`，
-   支持原厂 ioctl 150/151、`read()` 取 4 字节小端 int、`poll`。改进：
-   改用 `acpi_install_gpe_handler`+`acpi_enable_gpe` 交 ACPICA 管理
-   （原厂手写 request_irq(9) 在新内核会与 ACPI 冲突）；只动这两个键，
-   不碰电源/Reset 的 GPE；模块参数 `enable_buttons=0` 可关。
+3. **Select/Scroll 两键**（源自 `sci.c`）：PCH GPIO2/3，按下上报 4/5；
+   misc 设备 `/dev/wixbtn`，支持原厂 ioctl 150/151、`read()` 取 4 字节
+   小端 int、`poll`；模块参数 `enable_buttons=0` 可关。
+   **实现方式（实测后改为轮询）**：最初按原厂思路用 PCI 0xB8 路由到
+   GPE18/19 + INV 翻转 + `acpi_install_gpe_handler(LEVEL_TRIGGERED)`，
+   但电平触发 GPE 在处理期间若未及时撤销会触发 ACPICA 的 GPE-storm
+   保护，GPE 被**永久关闭**（现象：第一次按键能唤醒，之后全部失效，
+   重启用户程序也无效，只有重载模块恢复）。最终方案：不碰 ACPI/GPE，
+   把 GPIO2/3 配成普通输入（清 INV），用内核 `timer_list` 每 20ms
+   轮询 PCH GPIO_LVL 寄存器，软件去抖（稳定 60ms 才确认），在"离开
+   空闲电平"的按下沿入同一事件队列。无中断风暴、用户程序重启无影响。
 
 ### 11.2 Python 层 `workspace/python/`（Python 2.7/3 通用，实现与操作分离）
 

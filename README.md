@@ -20,7 +20,8 @@ Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 
 - **128×64 单色 LCM**：整屏 / 按页写入、任意点阵内容（ST7565 兼容控制器）
 - **LCD 背光**：亮 / 灭 / 硬件闪烁三态，支持 sysfs、标准 backlight class 与 ioctl
-- **两个前面板按键**：Select、Scroll，中断驱动（ACPI GPE），支持阻塞/非阻塞读取、
+- **两个前面板按键**：Select、Scroll，内核 20ms 轮询 PCH GPIO 电平并软件去抖
+  （避免 ACPI GPE 电平中断被风暴保护永久关闭），支持阻塞/非阻塞读取、
   `poll` 与 Python 回调
 - **动态加载**：单个 `.ko`，无需重编内核；在非 px2-300d 机器上会安全拒绝加载
 - **Python 接口层**：硬件能力与业务操作分离，内置 5×7 点阵字库与帧缓存
@@ -34,7 +35,7 @@ Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 
 - 显示数据通过 Super-I/O GPIO **软件模拟 8080 并行总线**传输；
 - 背光走 NCT6776F 的 AUXFANOUT（PWM）引脚；
-- Select / Scroll 按键接 Intel ICH8 PCH GPIO2/GPIO3，路由到 ACPI GPE18/GPE19。
+- Select / Scroll 按键接 Intel ICH8 PCH GPIO2/GPIO3，由驱动轮询电平（不走 ACPI GPE）。
 
 完整的引脚映射、寄存器地址、ioctl ABI、初始化时序、背光复用前提等**技术细节**
 请参阅调研文档：[readfile/work.md](readfile/work.md)。
@@ -97,7 +98,7 @@ dmesg | tail         # 查看驱动日志
 
 ```sh
 echo 1 > /sys/class/misc/lcm/backlight    # 背光亮（0=灭, 1=亮, 2=闪烁）
-insmod wixlcm.ko wixdbg=1                 # 打印每次 GPIO/GPE 操作用于调试
+insmod wixlcm.ko wixdbg=1                 # 打印 GPIO/背光/按键轮询调试信息
 sh unload.sh                              # 卸载（自动息屏）
 ```
 
@@ -168,7 +169,7 @@ MyApp().run()                           # Ctrl-C 自动清理
 | `initialize` | `1` | 加载时初始化并点亮面板 |
 | `initial_backlight` | `1` | 加载时背光状态：0=灭 / 1=亮 / 2=闪烁 |
 | `enable_buttons` | `1` | 注册 `/dev/wixbtn` 按键设备 |
-| `wixdbg` | `0` | 打印详细寄存器 / GPIO / GPE 调试信息 |
+| `wixdbg` | `0` | 打印详细寄存器 / GPIO / 背光 / 按键轮询调试信息 |
 
 ## 技术细节与原始资料
 
