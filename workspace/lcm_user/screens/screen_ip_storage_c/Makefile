@@ -3,7 +3,9 @@
 # Run:                                sudo ./screen_ip_storage
 
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -std=c11
+# -D_GNU_SOURCE：让 -std=c11 严格模式下也能看到 struct ifreq/IFNAMSIZ/
+# IFF_UP（net/if.h）与 popen/pclose（stdio.h）等 POSIX/GNU 声明。
+CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11 -D_GNU_SOURCE
 TARGET  := screen_ip_storage
 OBJS    := screen_ip_storage.o
 

@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
+/* 必须在任何系统头文件之前定义：-std=c11 严格 ISO 模式下，
+ * struct ifreq / IFNAMSIZ / IFF_UP / popen / pclose 等
+ * POSIX/GNU 声明需要 _GNU_SOURCE（等价地也可用 _DEFAULT_SOURCE）才可见。
+ */
+#define _GNU_SOURCE
+
 /*
  * screen_ip_storage.c - px2-300d 前面板 128x64 OLED 状态屏（C 版）
  *
