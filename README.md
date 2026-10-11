@@ -10,6 +10,11 @@ Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 
 > 已在 Ubuntu（kernel 6.8.0-138-generic）上完成模块编译，硬件寄存器时序与
 > 原厂驱动逐行一致。
+## 前面板状态：
+
+> sudo python3 workspace/python/screens/screen_ip_storage.py
+
+![screen_ip_storage 实拍前面板效果](readfile/ShowImage/jpeg1.jpg)
 
 ## 功能特性
 
@@ -21,7 +26,7 @@ Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 - **Python 接口层**：硬件能力与业务操作分离，内置 5×7 点阵字库与帧缓存
 - **节能状态屏示例**：IP / ZFS 容量显示、相同帧不刷新、10 秒无变化自动关背光、
   按任意键唤醒
-- 仅依赖 Linux 内核头文件与 Python 标准库（Python 2.7 / 3 通用库接口）
+- 仅依赖 Linux 内核头文件与 Python 标准库（Python 2.7 / 3 通用库接口） 
 
 ## 硬件说明
 
