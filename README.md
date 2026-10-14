@@ -12,7 +12,7 @@ Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 > 原厂驱动逐行一致。
 ## 前面板状态：
 
-> sudo python3 workspace/lcm_user/screens/screen_ip_storage.py
+> sudo python3 workspace/lcm_user/some_idea/screen_ip_storage.py
 
 ![screen_ip_storage 实拍前面板效果](readfile/ShowImage/jpeg1.jpg)
 
@@ -61,14 +61,11 @@ px2_300d_lcd/
     │   └── unload.sh             rmmod 卸载脚本
     │
     └── lcm_user/
-        ├── px2lcm.py                           通用硬件接口层（唯一操作 /dev/lcm 的模块）
-        ├── examples/                           基础与回调示例
-        │   ├── demo_on.py / demo_off.py        开屏 / 关屏
-        │   ├── demo_white.py / demo_black.py   全亮 / 全黑
-        │   ├── demo_stripe.py                  间隔 1 亮 1 黑
-        │   └── demo_callback.py                按键回调（推荐写法）
-        └── screens/
-            ├── screen_ip_storage.py         IP / ZFS 状态屏（Python 实际应用）
+        ├── example.py                        通用硬件接口层（唯一操作 /dev/lcm 的模块，
+        │                                    直接运行可做背光/开屏/全亮/全黑/条纹冒烟自检）
+        └── some_idea/
+            ├── screen_ip_storage/
+            │   └── screen_ip_storage.py         IP / ZFS 状态屏（Python 实际应用）
             └── screen_ip_storage_c/         同一状态屏的 C 语言实现
                 ├── screen_ip_storage.c
                 ├── glyph.h                  5x7 ASCII 点阵字库
@@ -102,18 +99,16 @@ insmod wixlcm.ko wixdbg=1                 # 打印 GPIO/背光/按键轮询调�
 sh unload.sh                              # 卸载（自动息屏）
 ```
 
-### 2. 运行 Python 示例
+### 2. 通用接口层冒烟自检
 
 ```sh
 cd workspace/lcm_user
-sudo python3 examples/demo_white.py        # 全亮
-sudo python3 examples/demo_stripe.py       # 竖条纹
-sudo python3 examples/demo_callback.py     # 常驻：按 Select/Scroll 联动屏幕，Ctrl-C 退出
+sudo python3 example.py        # 背光/开屏 -> 全亮 -> 全黑 -> 竖条纹 -> 关屏背光灭
 ```
 
 ### 3. 运行 IP / 存储状态屏
 
-编辑 [screen_ip_storage.py](workspace/lcm_user/screens/screen_ip_storage.py)
+编辑 [screen_ip_storage.py](workspace/lcm_user/some_idea/screen_ip_storage.py)
 开头的常量后运行：
 
 ```python
@@ -123,7 +118,7 @@ STORAGE_DEV = {"FS": "ZFS", "PoolName": "zfspool", "ShowName": "zfspool"}
 ```
 
 ```sh
-sudo python3 screens/screen_ip_storage.py
+sudo python3 some_idea/screen_ip_storage.py
 ```
 
 界面（`E1/E2` 标签 + 网卡 IP + up 状态 + ZFS 池 ALLOC/SIZE 实心进度条），
@@ -132,7 +127,7 @@ sudo python3 screens/screen_ip_storage.py
 同屏还有一个**功能完全等价的 C 语言版本**（直接 ioctl，无需 Python）：
 
 ```sh
-cd workspace/lcm_user/screens/screen_ip_storage_c
+cd workspace/lcm_user/some_idea/screen_ip_storage_c
 make
 sudo ./screen_ip_storage
 ```
@@ -142,10 +137,10 @@ STORAGE_SHOWNAME / ZPOOL_CMD / REFRESH_INTERVAL / IDLE_OFF_SECONDS` 供修改。
 
 ## 编程模型
 
-通用接口 [px2lcm.py](workspace/lcm_user/px2lcm.py) 把"硬件能力"与"业务操作"分开：
+通用接口 [example.py](workspace/lcm_user/example.py) 把"硬件能力"与"业务操作"分开：
 
 ```python
-from px2lcm import FrontPanel
+from example import FrontPanel
 
 class MyApp(FrontPanel):
     def on_start(self):                 # 启动回调
@@ -159,7 +154,7 @@ MyApp().run()                           # Ctrl-C 自动清理
 ```
 
 也可直接使用底层类 `PX2LCM`（显示 / 背光 / 写显存）和 `WixButtons`
-（读键 / 回调监听），详见各示例文件。
+（读键 / 回调监听），详见 example.py 文件头注释与自检代码。
 
 ## 内核模块参数
 

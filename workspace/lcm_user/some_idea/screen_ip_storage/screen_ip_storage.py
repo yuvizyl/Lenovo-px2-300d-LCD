@@ -17,8 +17,6 @@ screen_ip_storage.py - px2-300d 前面板 128x64 OLED 状态屏（对应照片�
     后自动关闭背光；
   - 背光关闭期间画面内容照常更新（显存照写），但只有按下 Select/Scroll
     任意一键才重新点亮背光，并维持 IDLE_OFF_SECONDS 秒。
-
-系统：Debian 13，Python 3。所有硬件操作只通过通用接口 px2lcm.PX2LCM，
 本文件用函数实现：系统信息采集 -> 128x64 显存绘制 -> write_frame 下发。
 
 运行：sudo python3 screen_ip_storage.py        （需已 insmod wixlcm.ko）
@@ -34,9 +32,9 @@ import fcntl
 import threading
 import subprocess
 
-# 引用上一级目录中的通用接口 px2lcm.py（只它一个文件直接操作 /dev/lcm）
+# 引用上一级目录中的通用接口 example.py（只它一个文件直接操作 /dev/lcm）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from px2lcm import PX2LCM, WixButtons, LCMError  # noqa: E402
+from example import PX2LCM, WixButtons, LCMError  # noqa: E402
 
 # =======================================================================
 # 用户可配置常量（按需修改）
@@ -51,7 +49,7 @@ ZPOOL_CMD = "/sbin/zpool"   # zpool 可执行文件位置
 REFRESH_INTERVAL = 5        # 画面刷新间隔（秒）
 IDLE_OFF_SECONDS = 10       # 画面连续多少秒无变化后关闭背光（按任意键恢复）
 
-# ---- 屏幕几何（px2lcm 显存：8 页 x 128 列，每字节 8 个纵向像素）----
+# ---- 屏幕几何（example 显存：8 页 x 128 列，每字节 8 个纵向像素）----
 SCREEN_W = 128
 SCREEN_H = 64
 PAGES = 8
