@@ -31,11 +31,146 @@ import time
 import socket
 import struct
 import fcntl
+import array
 import subprocess
 
-# 引用上一级目录中的通用接口 example.py（只它一个文件直接操作 /dev/lcm）
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from example import PX2LCM, LCMError  # noqa: E402
+# =======================================================================
+# 内联自 example.py：PX2LCM 屏幕/背光原语 + LCMError
+# （原本通过 sys.path 引用 ../example.py，现在独立为单文件可运行）
+# =======================================================================
+
+# ---- ioctl 编码（与内核 lcm_uapi.h 保持一致）----
+_IOC_NONE = 0
+_IOC_WRITE = 1
+_IOC_READ = 2
+
+
+def _IOC(direction, ioctype, nr, size):
+    return (direction << 30) | (size << 16) | (ioctype << 8) | nr
+
+
+def _IO(ioctype, nr):
+    return _IOC(_IOC_NONE, ioctype, nr, 0)
+
+
+def _IOR(ioctype, nr, size):
+    return _IOC(_IOC_READ, ioctype, nr, size)
+
+
+def _IOW(ioctype, nr, size):
+    return _IOC(_IOC_WRITE, ioctype, nr, size)
+
+
+# ---- /dev/lcm：屏幕 + 背光 ----
+LCM_IOC_MAGIC = 0xDD
+IOCTL_DISPLAY_COMMAND = _IO(LCM_IOC_MAGIC, 1)
+WIX_LCM_IOC_BL_SET = _IOW(LCM_IOC_MAGIC, 10, 4)
+
+WIX_LCM_CMD_PON = 7
+WIX_LCM_CMD_POFF = 8
+WIX_LCM_CMD_RESET = 9
+
+BACKLIGHT_OFF = 0
+BACKLIGHT_ON = 1
+BACKLIGHT_BLINK = 2
+
+# ---- 屏幕几何 ----
+PAGE_COUNT = 8
+COLUMN_COUNT = 128
+PAGE_BYTES = 128
+
+# struct lcm_info { int ctrl,page,column,size; char data[128]; } = 144 字节
+_STRUCT_HEAD = "iiii"
+_STRUCT_SIZE = struct.calcsize(_STRUCT_HEAD) + PAGE_BYTES
+
+
+class LCMError(IOError):
+    """前面板设备操作异常。"""
+    pass
+
+
+class PX2LCM(object):
+    """/dev/lcm 的薄封装：显示开关、背光三态、按页/整屏写显存。"""
+
+    WIDTH = COLUMN_COUNT
+    HEIGHT = 64
+    PAGES = PAGE_COUNT
+
+    def __init__(self, device="/dev/lcm"):
+        self.device = device
+        self.fd = -1
+        try:
+            self.fd = os.open(device, os.O_RDWR)
+        except OSError as exc:
+            raise LCMError(
+                "无法打开 %s: %s。请确认已 insmod wixlcm.ko 并以 root 运行。"
+                % (device, exc))
+
+    # ---- 资源管理 ----
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    # ---- 内部：下发一帧 ioctl ----
+    def _command(self, ctrl, page=0, column=0, payload=b""):
+        size = len(payload)
+        if not 0 <= page < PAGE_COUNT:
+            raise ValueError("page 必须在 0~%d 之间" % (PAGE_COUNT - 1))
+        if not 0 <= column < COLUMN_COUNT:
+            raise ValueError("column 必须在 0~%d 之间" % (COLUMN_COUNT - 1))
+        if size > PAGE_BYTES or column + size > COLUMN_COUNT:
+            raise ValueError("一次最多写 %d 字节且 column+size<=%d"
+                             % (PAGE_BYTES, COLUMN_COUNT))
+
+        buf = bytearray(_STRUCT_SIZE)
+        struct.pack_into(_STRUCT_HEAD, buf, 0, ctrl, page, column, size)
+        if size:
+            buf[16:16 + size] = bytearray(payload)
+        try:
+            fcntl.ioctl(self.fd, IOCTL_DISPLAY_COMMAND, buf, 1)
+        except IOError as exc:
+            raise LCMError("ioctl 失败: %s" % exc)
+
+    # ---- 显示开关 ----
+    def display_on(self):
+        self._command(WIX_LCM_CMD_PON)
+
+    def display_off(self):
+        self._command(WIX_LCM_CMD_POFF)
+
+    # ---- 背光 ----
+    def set_backlight(self, state):
+        if state not in (BACKLIGHT_OFF, BACKLIGHT_ON, BACKLIGHT_BLINK):
+            raise ValueError("背光状态只能是 0(灭)/1(亮)/2(闪烁)")
+        arg = array.array('i', [state])
+        try:
+            fcntl.ioctl(self.fd, WIX_LCM_IOC_BL_SET, arg, 1)
+        except IOError as exc:
+            raise LCMError("设置背光失败: %s" % exc)
+
+    def backlight_on(self):
+        self.set_backlight(BACKLIGHT_ON)
+
+    def backlight_off(self):
+        self.set_backlight(BACKLIGHT_OFF)
+
+    # ---- 显存写入 ----
+    def write_page(self, page, data, column=0):
+        self._command(WIX_LCM_CMD_RESET, page, column, data)
+
+    def write_frame(self, frame):
+        if len(frame) != PAGE_COUNT * PAGE_BYTES:
+            raise ValueError("整屏数据必须为 %d 字节"
+                             % (PAGE_COUNT * PAGE_BYTES))
+        raw = bytearray(frame)
+        for page in range(PAGE_COUNT):
+            start = page * PAGE_BYTES
+            self.write_page(page, bytes(raw[start:start + PAGE_BYTES]))
+
+# =======================================================================
+# 以下为 screen_ip_storage 自身的业务代码
+# =======================================================================
 
 # LCM_VERBOSE=1 时打印启动/周期状态到 stdout；默认安静（适配 systemd journal）
 VERBOSE = os.environ.get("LCM_VERBOSE", "") not in ("", "0", "false", "False")

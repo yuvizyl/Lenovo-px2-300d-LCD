@@ -339,34 +339,37 @@ sudo ./app
 
 ---
 
-## 6. v1.2 自动节能背光行为（内核驱动内置）
+## 6. v1.3 自动节能背光行为（内核驱动内置）
 
-从 v1.2 起，`wixlcm.ko` 自身管理背光的**自动唤醒 / 自动熄灭**逻辑，
-用户态程序通常**无需再自己实现"帧无变化 N 秒后关背光 / 按键唤醒"的节能循环**。
+从 v1.3 起，`wixlcm.ko` 以**周期性检查**模型管理背光的
+自动唤醒 / 自动熄灭逻辑，用户态程序通常**无需再自己实现节能循环**。
 
 ### 6.1 默认行为
 
 | 时刻 | 驱动行为 |
 |---|---|
-| 模块加载 | 背光 **灭**（`initial_backlight=0`），面板控制器仍正常初始化 |
-| 任意物理键按下（Select / Scroll） | 背光自动点亮，并启动一个 **10 秒自动熄灭** 计时器 |
-| 10 秒内再次按键 | **重置** 10 秒计时器（取最后一次按键），不会被"卡住" |
-| 10 秒到期 | 背光自动熄灭，继续等待下一次按键 |
-| 用户态主动操作背光 | 自动熄灭计时器被**取消**，避免内核与用户态相互覆盖 |
+| 模块加载 | 背光 **灭**（`initial_backlight=0`），同时启动一个每 `auto_off_ms`（默认 10 秒）触发一次的周期性检查计时器 |
+| 任意物理键按下（Select / Scroll） | 背光自动点亮，并在 `bl_keypress_since_check` 原子标志上置 1 |
+| 周期性检查触发 | 读取并清零 `bl_keypress_since_check` 标志：有按键 → 保持亮；无按键 → 熄灭。计时器立即重新 arm |
+| 用户态主动操作背光 | 周期性检查计时器被**取消**，避免内核与用户态相互覆盖；下次按键重新 arm |
+
+**与 v1.2 的语义差异**：v1.2 是"按键触发 N 秒倒计时、每次按键重置倒计时"，熄屏时刻精确为最后一次按键后 auto_off_ms。v1.3 改为"固定周期检查、每个周期内发现无按键才熄灭"，实际熄屏时刻落在某个检查边界——可能在最后一次按键后 auto_off_ms 到 2×auto_off_ms 之间，具体对齐到下一个检查点。按键只负责点亮背光和置标志，**不再重置计时**。
+
+**另一个 v1.3 行为变化**：v1.2 中如果 `initial_backlight=1`（加载即亮）、且之后没有任何按键，背光会一直亮——因为没有按键触发 `delayed_work`。v1.3 中周期性检查在模块加载时就 arm 了，所以 `initial_backlight=1` 也会在 auto_off_ms 后因"无按键活动"而自动熄灭。想要"加载即亮且永不自动熄"的场景，请同时设 `auto_off_ms=0` 或 `auto_off_on_keypress=0`。
 
 ### 6.2 和用户态程序的协作方式
 
 - **完全不冲突**：用户态通过 `ioctl(WIX_LCM_IOC_BL_SET)`、
   `/sys/class/misc/lcm/backlight`、或标准 `backlight class`
   接口的**任何一次写入**，内核都会立刻 `cancel_delayed_work_sync`
-  取消内部的自动熄灭计时器。之后内核不再干涉背光状态，直到下一次
-  物理按键按下才重新进入"自动唤醒 + 自动熄灭"周期。
+  取消内部的周期性检查计时器。之后内核不再干涉背光状态，直到下一次
+  物理按键按下才重新 arm 周期。
 - **用户态只想显示一次画面**：直接 `backlight_on()` 画完 `backlight_off()`，
-  内核的自动计时器被用户态的 BL_OFF 操作取消，下一次按键会重新亮屏。
+  内核的周期性检查计时器被用户态的 BL_OFF 操作取消，下一次按键会重新亮屏。
 - **用户态想保持常亮**：循环里定时 `backlight_on()` 即可，内核计时器每次
   被取消、每次按键又被重新 arm，不会出现"用户刚开屏内核又关掉"的打架。
 - **要完全关闭自动节能**：`insmod wixlcm.ko auto_off_on_keypress=0`
-  或 `auto_off_ms=0`；也可以把 `auto_off_ms` 设成一个大值。
+  或 `auto_off_ms=0`；后者连周期性检查都不启动。
 - **关键耦合：`enable_buttons=1` 是自动背光的前提**。按键检测定时器
   `btn_poll_timer` 只在 `wix_buttons_init()` 里启动，而后者受
   `enable_buttons` 模块参数控制。如果 `insmod wixlcm.ko enable_buttons=0`，
@@ -383,16 +386,21 @@ insmod wixlcm.ko initial_backlight=1 auto_off_ms=5000 auto_off_on_keypress=1
 |---|---|---|
 | `initial_backlight` | `0` | 加载时背光状态 |
 | `enable_buttons` | `1` | 注册 `/dev/wixbtn` 按键设备；**自动背光也依赖此参数**——设 0 会同时关闭按键检测和自动唤醒 |
-| `auto_off_ms` | `10000` | 最后一次按键后多少毫秒自动熄灭（0 = 永不自动熄） |
-| `auto_off_on_keypress` | `1` | 物理按键是否自动点亮 + 重置计时；需要 `enable_buttons=1` 才有按键检测 |
+| `auto_off_ms` | `10000` | 周期性检查间隔（ms，0 禁用周期性检查） |
+| `auto_off_on_keypress` | `1` | 物理按键是否自动点亮背光并置"有按键"标志；需要 `enable_buttons=1` 才有按键检测 |
 
 ### 6.4 实现要点（给关心驱动行为的开发者）
 
 - 按键检测在 `btn_poll_timer`（定时器 softirq 上下文）里发现后
   **只 schedule 一个 work_struct**，不直接碰背光——因为背光硬件
   访问 `backlight_hw_set()` 要持 `sio_lock` mutex，而 softirq 里
-  不能持 mutex。实际的"点亮 + mod_delayed_work"在 workqueue
+  不能持 mutex。实际的"点亮背光 + 置原子标志"在 workqueue
   进程上下文 `bl_keypress_work_func` 里做。
+- **周期性检查器 `bl_autooff_work_func` 的核心逻辑**：
+  1. 首先 `mod_delayed_work` 无条件重新 arm 自己——保证周期永远不停；
+  2. 然后 `atomic_xchg(&bl_keypress_since_check, 0)`——原子地读并清零标志；
+  3. 如果返回 0 → 自上次检查以来没有按键 → 调用 `backlight_hw_set(OFF)` 熄灭；
+  4. 如果返回 1 → 有按键 → 什么都不做（背光保持亮）。
 - 用户态 `backlight_set_state()` 内部先 `cancel_delayed_work_sync`
   再写硬件；work 回调则反过来——**只写硬件、不走 backlight_set_state**，
   避免自己 cancel 自己死锁。
@@ -400,7 +408,7 @@ insmod wixlcm.ko initial_backlight=1 auto_off_ms=5000 auto_off_on_keypress=1
   "btn_poll_timer schedule_work 之后、work 还没执行时用户态已
   经关掉背光"的竞态：work 执行时对比自己 schedule 时拍的快照
   和当前计数器值，不一样就放弃这次"唤醒"。
-- **按键事件队列有深度上限 `BTN_EVENT_QUEUE_MAX=64`**（v1.2 新增）。
+- **按键事件队列有深度上限 `BTN_EVENT_QUEUE_MAX=64`**。
   因为 v1.2 后用户态状态屏不再打开 `/dev/wixbtn`，但按键检测定时器
   仍在 `enable_buttons=1` 时运行——如果不限长，每次按键都会 `kmalloc`
   一个事件节点而没人读出来，就是内核内存泄漏。队满时新事件丢弃
@@ -421,8 +429,8 @@ insmod wixlcm.ko initial_backlight=1 auto_off_ms=5000 auto_off_on_keypress=1
   三种途径任选。
 - **按键交互**：阻塞等待、非阻塞轮询、`select`/`poll` 超时多路等待、
   Python 回调线程；每按一下上报一个事件。
-- **节能状态屏范式**（参考实现已验证）：内核驱动 v1.2 已内置
-  按键自动唤醒 + 10 秒无后续按键自动熄灭，用户态只需帧缓存比对、
+- **节能状态屏范式**（参考实现已验证）：内核驱动 v1.3 已内置
+  按键自动唤醒 + 每 10 秒周期性检查息屏，用户态只需帧缓存比对、
   相同帧不下发即可（减少 I/O）。无需再写 `unchanged` 计数、
   `wake_event` 回调、`backlight_on/off` 等节能循环代码。
 - **系统信息采集搭配**：Python 用标准库 / subprocess（如

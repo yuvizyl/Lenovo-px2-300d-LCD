@@ -326,7 +326,7 @@ readfile/
 动态加载**的独立实现，原厂 ABI（ioctl 号、`lcm_structure` 144 字节、
 按键码、背光寄存器值）保持二进制兼容。
 
-### 11.1 内核模块 `workspace/lcm_driver/`（单文件模块 wixlcm.ko，v1.2）
+### 11.1 内核模块 `workspace/lcm_driver/`（单文件模块 wixlcm.ko，v1.3）
 
 | 文件 | 内容 |
 |---|---|
@@ -346,17 +346,14 @@ readfile/
    间接寄存器 bank 0x4E / reg 0x0309，三态 0xC0/0xD5/0xFF 与原厂一致。
    控制途径：ioctl `0xDD0A/0xDD0B`、`/sys/class/misc/lcm/backlight`、
    标准 `/sys/class/backlight/wixlcm/`（有 CONFIG 时）。
-   **v1.2 新增内核级自动节能**（原厂没有，由本独立驱动引入）：
-   - 加载后背光默认**熄灭**（`initial_backlight` 默认值从 1 改为 0）；
-   - 任意物理键（Select / Scroll）自动点亮背光，并 arm 一个
-     `delayed_work` 计时器（默认 10 秒 = `auto_off_ms`）；
-   - 连续按键：`mod_delayed_work` 自动替换到期时间，**取最后一次**
-     操作计时，期间完全不阻塞（按键事件本身仍通过原来的 queue
-     独立上报）；
-   - 10 秒到期后背光自动熄灭，继续等待下一次按键；
+   **v1.3 内核级自动节能**（原厂没有，由本独立驱动引入；v1.2 为事件触发模型，v1.3 改为周期性检查模型）：
+   - 加载后背光默认**熄灭**（`initial_backlight` 默认值 0），同时 arm 一个周期性检查 `delayed_work`（默认 10 秒 = `auto_off_ms`）；
+   - 任意物理键（Select / Scroll）自动点亮背光，并置原子标志 `bl_keypress_since_check = 1`；
+   - 周期性检查器每次触发：`atomic_xchg` 原子地读并清零标志 → 返回 0 表示自上次检查以来无按键 → 熄灭；返回 1 表示有按键 → 保持亮。然后 `mod_delayed_work` 无条件重新 arm 自己，周期永久不停；
+   - **v1.3 与 v1.2 的语义差异**：v1.2 是"按键触发 N 秒倒计时、每次按键 `mod_delayed_work` 重置倒计时"，熄屏时刻精确为最后一次按键后 auto_off_ms。v1.3 改为"固定周期检查、每个周期内发现无按键才熄灭"，熄屏时刻对齐到下一个检查边界（最后一次按键后 auto_off_ms ~ 2×auto_off_ms 之间）。按键只负责点亮背光和置标志，**不再重置检查时间点**；
    - 用户态通过任何途径（ioctl / sysfs / backlight class）主动
      操作背光时，`backlight_set_state()` 入口处立刻
-     `cancel_delayed_work_sync` **取消内核自动熄灭计时**，彻底
+     `cancel_delayed_work_sync` **取消周期性检查计时器**，彻底
      避免"用户刚开屏内核又关掉"的冲突。下一次物理按键才会
      重新 arm 计时器。
    - 安全细节：按键检测在 `btn_poll_timer`（定时器 softirq 上下文）
@@ -368,13 +365,13 @@ readfile/
      额外用一个 `atomic_t bl_user_op_seq` 序号计数器解决
      "timer schedule_work 之后、work 还没执行时用户态已经关掉
      背光"的竞态（work 对比快照 vs 当前序号，不一致就放弃唤醒）。
-   - 可配置：模块参数 `auto_off_ms`（0 禁用自动熄灭）、
-     `auto_off_on_keypress`（总开关）。
+   - 可配置：模块参数 `auto_off_ms`（0 禁用周期性检查）、
+     `auto_off_on_keypress`（按键是否自动点亮背光）。
    - **硬依赖 `enable_buttons=1`**：按键检测定时器 `btn_poll_timer`
      只在 `wix_buttons_init()` 里启动，而后者在 `enable_buttons=0`
      时跳过。关掉按键 = 关掉自动唤醒。
-   - **按键事件队列有限深** `BTN_EVENT_QUEUE_MAX=64`：v1.2 前用户态
-     总会打开 `/dev/wixbtn` 读事件，队列长度自然受控；v1.2 后状态屏
+   - **按键事件队列有限深** `BTN_EVENT_QUEUE_MAX=64`：最初用户态
+     总会打开 `/dev/wixbtn` 读事件，队列长度自然受控；v1.2 起状态屏
      应用不再打开此 fd，但按键检测定时器仍在 `enable_buttons=1` 时
      运行——不设上限就是每次按键都 `kmalloc` 一个节点而没人读，
      内核内存泄漏。队满时新事件丢弃（~1 KB 上限，远超正常交互量）。
@@ -418,15 +415,15 @@ readfile/
     `/sbin/zpool list -Hp -o alloc,size` 的 ALLOC/SIZE **实心像素**进度条
     （非 '#' 字符）。文件内置 5x7 ASCII 字库，函数划分"采集/绘制/下发"，
     5 秒刷新；帧缓存比对相同帧不下发（减少 I/O）。
-    **v1.2 适配**：背光节能循环（无变化 N 秒关背光 + 按键唤醒）已从
-    用户态删除，完全交给内核驱动 `wixlcm.ko` v1.2 内置管理——内核在
-    按键时自动点亮、10 秒无后续按键自动熄灭，用户态不再调任何
-    `backlight_on/off`。启动时亮一次背光让用户看到初始画面。
+    **v1.3 适配**：背光节能循环已从用户态删除，完全交给内核驱动
+    `wixlcm.ko` v1.3 内置管理——按键时自动点亮 + 每 10 秒周期性检查
+    无活动则熄灭，用户态不再调任何 `backlight_on/off`。启动时亮一次
+    背光让用户看到初始画面。
   - `screens/screen_ip_storage_c/`：上述状态屏的 **C 语言等价实现**
     （`screen_ip_storage.c` + 复制的 `lcm_uapi.h` + Makefile）：直接用
     ioctl 操作 `/dev/lcm`（SIOCGIFADDR / SIOCGIFFLAGS 查网卡、
     `popen("/sbin/zpool list -Hp -o alloc,size")` 查容量）。
-    **v1.2 同样适配**：删除了按键读取和背光管理代码，帧缓存比对保留。
+    **v1.3 同样适配**：删除了按键读取和背光管理代码，帧缓存比对保留。
 
 ### 11.3 真机使用
 
