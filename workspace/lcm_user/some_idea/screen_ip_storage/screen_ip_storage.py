@@ -37,6 +37,9 @@ import subprocess
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from example import PX2LCM, LCMError  # noqa: E402
 
+# LCM_VERBOSE=1 时打印启动/周期状态到 stdout；默认安静（适配 systemd journal）
+VERBOSE = os.environ.get("LCM_VERBOSE", "") not in ("", "0", "false", "False")
+
 # =======================================================================
 # 用户可配置常量（按需修改）
 # =======================================================================
@@ -336,7 +339,9 @@ def render_frame(status):
 #         背光自动管理由内核驱动 wixlcm.ko 负责
 # =======================================================================
 def log_status(status):
-    """在终端打印一行当前状态（与屏幕内容一致）。"""
+    """在终端打印一行当前状态（与屏幕内容一致）。仅 verbose 时输出。"""
+    if not VERBOSE:
+        return
     print("E1 %-15s [%s]   E2 %-15s [%s]   %s ALLOC/SIZE=%.1f%%"
           % (status["ip1"]["ip"] or "-",
              "#" if status["ip1"]["up"] else " ",
@@ -355,11 +360,12 @@ def run_loop(lcd):
     背光的自动唤醒 / 10 秒后自动熄灭由内核驱动 v1.2 内置管理，
     本函数不再调用任何 backlight_on/off。
     """
-    print("状态屏启动：%s/%s，存储 %s；每 %d 秒刷新，"
-          "背光节能由内核自动管理（默认按键后 10 秒无后续即熄灭），"
-          "Ctrl-C 退出"
-          % (IP1DEV, IP2DEV, STORAGE_DEV.get("ShowName", ""),
-             REFRESH_INTERVAL))
+    if VERBOSE:
+        print("状态屏启动：%s/%s，存储 %s；每 %d 秒刷新，"
+              "背光节能由内核自动管理（默认按键后 10 秒无后续即熄灭），"
+              "Ctrl-C 退出"
+              % (IP1DEV, IP2DEV, STORAGE_DEV.get("ShowName", ""),
+                 REFRESH_INTERVAL))
 
     last_frame = None
     while True:
@@ -378,7 +384,7 @@ def main():
     try:
         lcd = PX2LCM()
     except LCMError as exc:
-        print(exc)
+        print(exc, file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -388,7 +394,7 @@ def main():
         lcd.display_on()
         run_loop(lcd)
     except KeyboardInterrupt:
-        print("\n退出 ...")
+        pass
     finally:
         # 应用进程退出时把背光熄灭，屏幕控制器也关掉——
         # 这是 cleanup，不是节能循环的一部分。

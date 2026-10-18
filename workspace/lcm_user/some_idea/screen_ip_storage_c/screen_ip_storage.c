@@ -92,6 +92,7 @@
 #define BAR_FILL_W     (SCREEN_W - 7 - 7)       /* 114 */
 
 static volatile sig_atomic_t g_running = 1;
+static int g_verbose;   /* LCM_VERBOSE=1 时置 1，打印周期状态 */
 
 static void on_sigint(int sig)
 {
@@ -347,6 +348,10 @@ int main(void)
 	uint8_t frame[FRAME_SIZE];
 	uint8_t last_frame[FRAME_SIZE];
 	int have_last = 0;
+	const char *ev;
+
+	ev = getenv("LCM_VERBOSE");
+	g_verbose = (ev && ev[0] && ev[0] != '0' && ev[0] != 'f' && ev[0] != 'F');
 
 	signal(SIGINT, on_sigint);
 	signal(SIGTERM, on_sigint);
@@ -363,10 +368,11 @@ int main(void)
 	lcm_set_backlight(lcd_fd, WIX_LCM_BL_ON);
 	lcm_display_cmd(lcd_fd, WIX_LCM_IOC_PON);
 
-	printf("状态屏启动(C)：%s/%s，存储 %s；每 %d 秒刷新，"
-	       "背光节能由内核自动管理（默认按键后 10 秒无后续即熄灭），"
-	       "Ctrl-C 退出\n",
-	       IP1DEV, IP2DEV, STORAGE_SHOWNAME, REFRESH_INTERVAL);
+	if (g_verbose)
+		printf("状态屏启动(C)：%s/%s，存储 %s；每 %d 秒刷新，"
+		       "背光节能由内核自动管理（默认按键后 10 秒无后续即熄灭），"
+		       "Ctrl-C 退出\n",
+		       IP1DEV, IP2DEV, STORAGE_SHOWNAME, REFRESH_INTERVAL);
 
 	while (g_running) {
 		struct panel_status st;
@@ -383,18 +389,19 @@ int main(void)
 			have_last = 1;
 		}
 
-		printf("E1 %-15s [%s]   E2 %-15s [%s]   %s ALLOC/SIZE=%.1f%%\n",
-		       st.ip1.ip[0] ? st.ip1.ip : "-",
-		       st.ip1.up ? "#" : " ",
-		       st.ip2.ip[0] ? st.ip2.ip : "-",
-		       st.ip2.up ? "#" : " ",
-		       st.storage_name, st.usage * 100.0);
-		fflush(stdout);
+		if (g_verbose) {
+			printf("E1 %-15s [%s]   E2 %-15s [%s]   %s ALLOC/SIZE=%.1f%%\n",
+			       st.ip1.ip[0] ? st.ip1.ip : "-",
+			       st.ip1.up ? "#" : " ",
+			       st.ip2.ip[0] ? st.ip2.ip : "-",
+			       st.ip2.up ? "#" : " ",
+			       st.storage_name, st.usage * 100.0);
+			fflush(stdout);
+		}
 
 		sleep(REFRESH_INTERVAL);
 	}
 
-	printf("\n退出 ...\n");
 	/* cleanup：熄灭背光 + 关闭屏幕控制器（进程退出时的收尾） */
 	lcm_set_backlight(lcd_fd, WIX_LCM_BL_OFF);
 	lcm_display_cmd(lcd_fd, WIX_LCM_IOC_POFF);

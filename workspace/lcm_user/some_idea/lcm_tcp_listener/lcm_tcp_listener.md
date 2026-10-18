@@ -25,9 +25,10 @@ listener 和 display 通过 `pthread_mutex_t` + `pthread_cond_t` 协作，
 ```sh
 cd workspace/lcm_user/some_idea/lcm_tcp_listener
 make
-sudo ./lcm_tcp_listener                     # 默认 127.0.0.1:6776
+sudo ./lcm_tcp_listener -s                   # 默认 127.0.0.1:6776
+sudo ./lcm_tcp_listener                      # 无参数 -> 打印 help
 sudo ./lcm_tcp_listener -b 0.0.0.0 -p 6776  # 监听所有网卡
-sudo ./lcm_tcp_listener -p 9000             # 换个端口
+sudo ./lcm_tcp_listener -p 9000              # 只换端口
 ```
 
 按下 Ctrl-C 或 `kill` 后，程序会把 `g_shutdown` 置 1、关闭监听 socket、

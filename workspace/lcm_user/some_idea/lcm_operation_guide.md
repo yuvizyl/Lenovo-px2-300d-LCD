@@ -447,7 +447,133 @@ insmod wixlcm.ko initial_backlight=1 auto_off_ms=5000 auto_off_on_keypress=1
 | [screen_ip_storage_c/glyph.h](screen_ip_storage_c/glyph.h) | C 版 5×7 ASCII 点阵字库（含 `find_glyph`） |
 | [screen_ip_storage_c/lcm_uapi.h](screen_ip_storage_c/lcm_uapi.h) | 可供 C 新应用复制的 ABI 头文件副本 |
 
-## 9. 新应用开发落点（`some_idea/`）
+---
+
+## 9. systemd 部署与日志策略（所有新应用必读）
+
+### 9.1 推荐的部署方式
+
+`some_idea/` 下每个应用都应能作为 systemd service 长期运行。
+仓库根目录提供了 [lcm.service](lcm.service) 单元文件，默认路径约定：
+
+| 路径 | 内容 |
+|---|---|
+| `/root/lcm/wixlcm.ko` | 内核模块 |
+| `/root/lcm/example.py` | Python 通用接口层 |
+| `/root/lcm/some_idea/` | 所有用户态应用源码/二进制 |
+
+安装：
+
+```sh
+# 1. 拷贝文件（按需调整）
+cp wixlcm.ko                /root/lcm/
+cp example.py               /root/lcm/
+cp -r some_idea             /root/lcm/
+
+# 2. C 版需要先编译
+cd /root/lcm/some_idea/screen_ip_storage_c && make
+cd /root/lcm/some_idea/lcm_tcp_listener    && make
+
+# 3. 安装 unit 文件并启用
+cp /root/lcm/some_idea/lcm.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now lcm
+
+# 4. 看日志
+journalctl -u lcm -f              # 实时
+journalctl -u lcm -b              # 本次启动以来
+journalctl -u lcm -n 50 --no-pager
+```
+
+`lcm.service` 默认跑 Python 状态屏。切换应用只需改 `ExecStart=`：
+
+```ini
+# 跑 C 版状态屏
+ExecStart=/root/lcm/some_idea/screen_ip_storage_c/screen_ip_storage
+
+# 跑 TCP 监听器（监听 127.0.0.1:6776）
+ExecStart=/root/lcm/some_idea/lcm_tcp_listener/lcm_tcp_listener -s
+
+# 跑 TCP 监听器（监听所有网卡）
+ExecStart=/root/lcm/some_idea/lcm_tcp_listener/lcm_tcp_listener -b 0.0.0.0 -p 6776
+```
+
+### 9.2 日志策略：默认安静，按需详细
+
+systemd 下进程的 stdout/stderr 会被 journald 收集进日志数据库。
+**周期刷屏日志**（每 5 秒一行状态、每个 TCP 请求一行 INFO 等）会快速
+撑爆日志存储，必须避免。
+
+`some_idea/` 下所有应用已统一适配：
+
+| 应用 | 默认行为 | 调试方式 |
+|---|---|---|
+| `screen_ip_storage.py` | 只在启动/错误时输出；**不**打印周期状态行 | `LCM_VERBOSE=1` 或取消 `lcm.service` 中 `Environment=LCM_VERBOSE=1` 注释 |
+| `screen_ip_storage.c` | 同上 | 同上 |
+| `lcm_tcp_listener.c` | 启动/退出/错误保留；**连接/请求内容**不打日志 | 同上（`LCM_VERBOSE=1` 启用 DEBUG 级别） |
+
+三个应用都用 `LCM_VERBOSE` 环境变量控制详细日志：
+
+```sh
+LCM_VERBOSE=1 journalctl -u lcm -f
+```
+
+或在 unit 文件里永久开启：
+
+```ini
+Environment=LCM_VERBOSE=1
+```
+
+### 9.3 编写新应用时的日志约束（AI / 开发者）
+
+在 `some_idea/` 下编写新应用时，**必须**遵守以下规则：
+
+1. **默认安静**：程序在 systemd 下运行时，stdout 只保留
+   - 一次性的启动信息（boot banner）
+   - stderr 的错误/告警
+   - 退出时的收尾信息
+
+2. **周期/高频事件**（定时轮询状态、每个网络请求、按键循环打点等）
+   全部挂到环境变量门控后，例如：
+
+   **Python：**
+   ```python
+   import os
+   VERBOSE = os.environ.get("LCM_VERBOSE", "") not in ("", "0", "false", "False")
+   # ...
+   if VERBOSE:
+       print("debug info")
+   ```
+
+   **C：**
+   ```c
+   static int g_verbose;
+   // main() 开头：
+   {
+       const char *ev = getenv("LCM_VERBOSE");
+       g_verbose = (ev && ev[0] && ev[0] != '0' && ev[0] != 'f' && ev[0] != 'F');
+   }
+   // 使用：
+   if (g_verbose) printf("debug info\n");
+   ```
+
+   **C 守护进程建议引入分级宏**（参考 `lcm_tcp_listener.c`）：
+   ```c
+   #define LOG_INFO(...)  log_msg("INFO",  __VA_ARGS__)   /* 永远输出 */
+   #define LOG_WARN(...)  log_msg("WARN",  __VA_ARGS__)   /* 永远输出 */
+   #define LOG_ERR(...)   log_msg("ERROR", __VA_ARGS__)   /* 永远输出 */
+   #define LOG_DEBUG(...) do { if (g_verbose) log_msg("DEBUG", __VA_ARGS__); } while (0)
+   ```
+
+3. **错误信息走 stderr**：让 systemd journal 自动分类。Python 用
+   `print(msg, file=sys.stderr)`，C 用 `fprintf(stderr, ...)` 或 `perror(...)`。
+
+4. **不要使用 print/printf 做"心跳"或"打点"**：这是 systemd 监控
+   `WatchdogSec=` 的工作，应用应通过 `systemd-notify WATCHDOG=1` 配合。
+
+---
+
+## 10. 新应用开发落点（`some_idea/`）
 
 - 新功能代码统一放在 `workspace/lcm_user/some_idea/` 下，Python 或 C
   任选，每个应用可建独立子目录。

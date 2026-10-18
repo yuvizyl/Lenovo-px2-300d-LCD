@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "base64.h"
@@ -49,6 +50,7 @@
 #define DEFAULT_PORT        6776
 #define HB_CHECK_INTERVAL   2   /* seconds */
 #define RECV_LINE_MAX       65536
+#define DISPLAY_HB_TICK_SEC 1   /* max idle seconds before display thread ticks heartbeat */
 
 /* ---------- shared state ---------- */
 static uint8_t  g_frame[FRAME_SIZE];
@@ -75,6 +77,8 @@ static int g_pending_backlight = -1;
 
 /* ---------- helpers ---------- */
 
+static int g_verbose;   /* LCM_VERBOSE=1 时启用 DEBUG 日志 */
+
 static void log_msg(const char *level, const char *fmt, ...)
 {
     char buf[512];
@@ -88,6 +92,7 @@ static void log_msg(const char *level, const char *fmt, ...)
 #define LOG_INFO(...)  log_msg("INFO",  __VA_ARGS__)
 #define LOG_WARN(...)  log_msg("WARN",  __VA_ARGS__)
 #define LOG_ERR(...)   log_msg("ERROR", __VA_ARGS__)
+#define LOG_DEBUG(...) do { if (g_verbose) log_msg("DEBUG", __VA_ARGS__); } while (0)
 
 static void on_signal(int sig)
 {
@@ -159,9 +164,23 @@ static void *display_thread(void *arg)
     ioctl(fd, WIX_LCM_IOC_BL_SET, &bl);
 
     while (!g_shutdown) {
+        /* tick heartbeat even while idle — so watchdog can tell
+         * "alive and waiting for work" apart from "truly stuck" */
+        g_display_hb++;
+
         pthread_mutex_lock(&g_mutex);
-        while (!g_frame_ready && !g_shutdown)
-            pthread_cond_wait(&g_cond, &g_mutex);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += DISPLAY_HB_TICK_SEC;
+        while (!g_frame_ready && !g_shutdown) {
+            pthread_cond_timedwait(&g_cond, &g_mutex, &ts);
+            if (!g_frame_ready && !g_shutdown) {
+                /* timed out — bump hb and re-arm */
+                g_display_hb++;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += DISPLAY_HB_TICK_SEC;
+            }
+        }
 
         if (g_shutdown) {
             pthread_mutex_unlock(&g_mutex);
@@ -197,7 +216,7 @@ static void *display_thread(void *arg)
         pthread_mutex_unlock(&g_mutex);
         if (bl_req >= 0 && bl_req <= 2) {
             ioctl(fd, WIX_LCM_IOC_BL_SET, &bl_req);
-            LOG_INFO("backlight set to %d", bl_req);
+            LOG_DEBUG("backlight set to %d", bl_req);
         }
 
         g_display_hb++;
@@ -241,7 +260,7 @@ static void handle_client(int client_fd)
         return;
     }
 
-    LOG_INFO("recv %d bytes JSON", rc);
+    LOG_DEBUG("recv %d bytes JSON", rc);
 
     mcj_obj *obj = mcj_parse(line);
     if (!obj) {
@@ -325,9 +344,12 @@ static void *listener_thread(void *arg)
     }
 
     g_listener_sock = sock;
-    g_listener_hb++;
 
     while (!g_shutdown) {
+        /* tick heartbeat every loop so watchdog sees liveness
+         * even when no client is connecting */
+        g_listener_hb++;
+
         /* use select so we can bail out cleanly on shutdown */
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -350,11 +372,10 @@ static void *listener_thread(void *arg)
             continue;
         }
 
-        LOG_INFO("accepted %s:%d",
+        LOG_DEBUG("accepted %s:%d",
                  inet_ntoa(caddr.sin_addr), ntohs(caddr.sin_port));
         handle_client(cfd);
         close(cfd);
-        g_listener_hb++;
     }
 
     close(sock);
@@ -402,7 +423,8 @@ static void *safe_join_reuse(pthread_t *tid, void *(*fn)(void *), const char *na
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s [-b bind_ip] [-p port]\n"
+        "Usage: %s [-s | -b bind_ip -p port]\n"
+        "  -s  Start with defaults (127.0.0.1:6776)\n"
         "  -b  Bind IP (default 127.0.0.1, use 0.0.0.0 for all interfaces)\n"
         "  -p  Listen port (default 6776)\n"
         "  -h  Show this help\n",
@@ -416,12 +438,19 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    {
+        const char *ev = getenv("LCM_VERBOSE");
+        g_verbose = (ev && ev[0] && ev[0] != '0' && ev[0] != 'f' && ev[0] != 'F');
+    }
+
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) {
             strncpy(g_bind_ip, argv[++i], sizeof(g_bind_ip) - 1);
         } else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
             g_port = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "-h")) {
+        } else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--start")) {
+            /* start with defaults (already set at file scope) */
+        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
         } else {

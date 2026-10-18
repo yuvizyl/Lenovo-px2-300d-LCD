@@ -1,0 +1,56 @@
+# px2-300d 前面板 LCM systemd 单元
+# ==================================
+#
+# 部署（默认路径，后续按需自行更改）：
+#   cp -r some_idea/ /root/lcm/some_idea/
+#   cp example.py    /root/lcm/
+#   cp wixlcm.ko     /root/lcm/
+#   cp lcm.service   /etc/systemd/system/
+#   systemctl enable --now lcm
+#
+# 调试：
+#   LCM_VERBOSE=1 systemctl restart lcm      # 启用应用内 verbose 日志
+#   journalctl -u lcm -f                      # 实时看日志
+#   journalctl -u lcm -b                      # 本次启动以来的日志
+#
+# systemd 日志策略：本 service 默认安静。三个 LCM 应用
+# (screen_ip_storage.py / screen_ip_storage.c / lcm_tcp_listener)
+# 的周期性状态行已统一挂在 LCM_VERBOSE 环境变量后，
+# 不设置时不刷屏，journal 只保留启动/错误/退出等一次性事件。
+
+[Unit]
+Description=px2-300d front panel LCM status screen
+# 不等待网络。内核模块加载不依赖网络，用户态应用只是读 sysfs/ioctl。
+# 系统完全启动后（multi-user.target）拉起。
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/lcm
+
+# 先尝试加载内核模块。'-' 前缀表示已加载时不视为失败。
+ExecStartPre=-/sbin/insmod /root/lcm/wixlcm.ko
+
+# 用户态应用。默认跑 Python 状态屏（screen_ip_storage.py）。
+# 如需改为 C 版，编译后改成：
+#   ExecStart=/root/lcm/some_idea/screen_ip_storage_c/screen_ip_storage
+# 如需改为 TCP 监听器：
+#   ExecStart=/root/lcm/some_idea/lcm_tcp_listener/lcm_tcp_listener -s
+ExecStart=/usr/bin/python3 /root/lcm/some_idea/screen_ip_storage/screen_ip_storage.py
+
+# 调试时取消下面注释，启用 verbose 日志（周期状态行、DEBUG 级别信息）
+# Environment=LCM_VERBOSE=1
+
+# 进程非零退出码时自动拉起（防止驱动加载失败后反复尝试可改为 on-failure）
+Restart=on-failure
+RestartSec=3
+
+# 注意：这里故意不卸载内核模块。rmmod 放在 ExecStopPost 会在每次
+# Restart=on-failure 重启循环时触发（崩溃 → rmmod → 等 3s → insmod → 启动），
+# 造成 /dev/lcm 短暂消失和屏幕闪烁。让模块常驻更合理。
+# 如果确实需要卸载，可以在 systemctl stop lcm 后手动执行：
+#   systemctl stop lcm && rmmod wixlcm
+# ExecStopPost=-/sbin/rmmod wixlcm
+
+[Install]
+WantedBy=multi-user.target

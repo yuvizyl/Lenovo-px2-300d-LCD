@@ -156,7 +156,7 @@ px2-300d 上的 **TCP 服务**：监听指定 IP:端口（默认 `127.0.0.1:6776
 - **三线程模型**：listener（socket accept + JSON 解析 + base64 解码）、
   display（唯一操作 `/dev/lcm` 的线程，串行所有 ioctl）、
   main 看门狗（每 2 秒检查线程存活，意外退出则重新拉起）。
-- **启动即打印 help**：无参数运行或 `-h` 都会输出使用说明并退出。
+- **启动即打印 help**：无参数运行或 `-h` / `--help` 都会输出使用说明并退出；`-s` / `--start` 使用默认配置（127.0.0.1:6776）直接启动。
 - **可选参数**：`-b bind_ip`（默认 `127.0.0.1`，可设 `0.0.0.0` 对外）、
   `-p port`（默认 `6776`）。
 - **零第三方依赖**：极简 base64 解码器 + 极简扁平 JSON 解析器均为手写。
@@ -164,8 +164,9 @@ px2-300d 上的 **TCP 服务**：监听指定 IP:端口（默认 `127.0.0.1:6776
 ```sh
 cd workspace/lcm_user/some_idea/lcm_tcp_listener
 make
-sudo ./lcm_tcp_listener -b 0.0.0.0 -p 6776   # 对外监听
-sudo ./lcm_tcp_listener                      # 无参数 -> 打印 help
+sudo ./lcm_tcp_listener -s                    # 默认 127.0.0.1:6776
+sudo ./lcm_tcp_listener -b 0.0.0.0 -p 6776    # 对外监听
+sudo ./lcm_tcp_listener                       # 无参数 -> 打印 help
 ```
 
 JSON 协议（每行一条）：
