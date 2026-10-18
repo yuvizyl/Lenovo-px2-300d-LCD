@@ -326,7 +326,7 @@ readfile/
 动态加载**的独立实现，原厂 ABI（ioctl 号、`lcm_structure` 144 字节、
 按键码、背光寄存器值）保持二进制兼容。
 
-### 11.1 内核模块 `workspace/lcm_driver/`（单文件模块 wixlcm.ko，v1.1）
+### 11.1 内核模块 `workspace/lcm_driver/`（单文件模块 wixlcm.ko，v1.2）
 
 | 文件 | 内容 |
 |---|---|
@@ -345,8 +345,39 @@ readfile/
 2. **LCD 背光**（源自 `gpiosio.c` 的 index27/AUXFANOUT）：LDN 0x0B
    间接寄存器 bank 0x4E / reg 0x0309，三态 0xC0/0xD5/0xFF 与原厂一致。
    控制途径：ioctl `0xDD0A/0xDD0B`、`/sys/class/misc/lcm/backlight`、
-   标准 `/sys/class/backlight/wixlcm/`（有 CONFIG 时）；模块参数
-   `initial_backlight`。
+   标准 `/sys/class/backlight/wixlcm/`（有 CONFIG 时）。
+   **v1.2 新增内核级自动节能**（原厂没有，由本独立驱动引入）：
+   - 加载后背光默认**熄灭**（`initial_backlight` 默认值从 1 改为 0）；
+   - 任意物理键（Select / Scroll）自动点亮背光，并 arm 一个
+     `delayed_work` 计时器（默认 10 秒 = `auto_off_ms`）；
+   - 连续按键：`mod_delayed_work` 自动替换到期时间，**取最后一次**
+     操作计时，期间完全不阻塞（按键事件本身仍通过原来的 queue
+     独立上报）；
+   - 10 秒到期后背光自动熄灭，继续等待下一次按键；
+   - 用户态通过任何途径（ioctl / sysfs / backlight class）主动
+     操作背光时，`backlight_set_state()` 入口处立刻
+     `cancel_delayed_work_sync` **取消内核自动熄灭计时**，彻底
+     避免"用户刚开屏内核又关掉"的冲突。下一次物理按键才会
+     重新 arm 计时器。
+   - 安全细节：按键检测在 `btn_poll_timer`（定时器 softirq 上下文）
+     里只 `schedule_work`，背光硬件操作挪到 workqueue 进程上下文
+     执行——因为 `backlight_hw_set()` 持 `sio_lock` mutex，softirq
+     里不能持 mutex。用户态 `backlight_set_state()` 里 `cancel_delayed_work`，
+     work 回调里反过只走 `backlight_hw_set`、不走
+     `backlight_set_state`，避免自己 cancel 自己死锁。
+     额外用一个 `atomic_t bl_user_op_seq` 序号计数器解决
+     "timer schedule_work 之后、work 还没执行时用户态已经关掉
+     背光"的竞态（work 对比快照 vs 当前序号，不一致就放弃唤醒）。
+   - 可配置：模块参数 `auto_off_ms`（0 禁用自动熄灭）、
+     `auto_off_on_keypress`（总开关）。
+   - **硬依赖 `enable_buttons=1`**：按键检测定时器 `btn_poll_timer`
+     只在 `wix_buttons_init()` 里启动，而后者在 `enable_buttons=0`
+     时跳过。关掉按键 = 关掉自动唤醒。
+   - **按键事件队列有限深** `BTN_EVENT_QUEUE_MAX=64`：v1.2 前用户态
+     总会打开 `/dev/wixbtn` 读事件，队列长度自然受控；v1.2 后状态屏
+     应用不再打开此 fd，但按键检测定时器仍在 `enable_buttons=1` 时
+     运行——不设上限就是每次按键都 `kmalloc` 一个节点而没人读，
+     内核内存泄漏。队满时新事件丢弃（~1 KB 上限，远超正常交互量）。
 3. **Select/Scroll 两键**（源自 `sci.c`）：PCH GPIO2/3，按下上报 4/5；
    misc 设备 `/dev/wixbtn`，支持原厂 ioctl 150/151、`read()` 取 4 字节
    小端 int、`poll`；模块参数 `enable_buttons=0` 可关。
@@ -386,14 +417,16 @@ readfile/
     常显示，`[]` 内为 `STORAGE_DEV['ShowName']`；最下方为
     `/sbin/zpool list -Hp -o alloc,size` 的 ALLOC/SIZE **实心像素**进度条
     （非 '#' 字符）。文件内置 5x7 ASCII 字库，函数划分"采集/绘制/下发"，
-    5 秒刷新；另带节能逻辑：帧缓存去重（相同帧不下发）、画面连续
-    `IDLE_OFF_SECONDS`（默认 10 秒）无变化自动关背光，按 Select/Scroll
-    任意一键重新点亮并重置 10 秒计时（背光关闭期间显存仍照常更新）。
+    5 秒刷新；帧缓存比对相同帧不下发（减少 I/O）。
+    **v1.2 适配**：背光节能循环（无变化 N 秒关背光 + 按键唤醒）已从
+    用户态删除，完全交给内核驱动 `wixlcm.ko` v1.2 内置管理——内核在
+    按键时自动点亮、10 秒无后续按键自动熄灭，用户态不再调任何
+    `backlight_on/off`。启动时亮一次背光让用户看到初始画面。
   - `screens/screen_ip_storage_c/`：上述状态屏的 **C 语言等价实现**
     （`screen_ip_storage.c` + 复制的 `lcm_uapi.h` + Makefile）：直接用
-    ioctl 操作 `/dev/lcm`、`/dev/wixbtn`（SIOCGIFADDR / SIOCGIFFLAGS 查网卡、
-    `popen("/sbin/zpool list -Hp -o alloc,size")` 查容量、`select` 等键），
-    常量同为文件开头的宏，`make && sudo ./screen_ip_storage` 运行。
+    ioctl 操作 `/dev/lcm`（SIOCGIFADDR / SIOCGIFFLAGS 查网卡、
+    `popen("/sbin/zpool list -Hp -o alloc,size")` 查容量）。
+    **v1.2 同样适配**：删除了按键读取和背光管理代码，帧缓存比对保留。
 
 ### 11.3 真机使用
 

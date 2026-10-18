@@ -8,20 +8,21 @@
 /*
  * screen_ip_storage.c - px2-300d 前面板 128x64 OLED 状态屏（C 版）
  *
- * 与 ../screen_ip_storage.py 功能完全一致：
+ * 与 Python 版 ../screen_ip_storage.py 功能完全一致：
  *
  *   E1  192.168.31.200           [#]   E1/E2 标签常显示，IP 查物理网卡，
  *   E2  192.168.124.200         [ ]       [#] 表示接口 up
  *   storage:   [zfspool]               storage 字段常显示，[] 内为 ShowName
  *   [########################          ] ZFS 池 ALLOC/SIZE 的实心像素进度条
  *
- * 节能：
- *   - 缓存上一帧，相同帧不下发；
- *   - 连续 IDLE_OFF_SECONDS（默认 10 秒）无变化后关闭背光；
- *   - 背光关闭期间显存照常更新；按 Select/Scroll 任意一键点亮并维持 10 秒。
+ * 背光节能（v1.2 适配）：
+ *   - 自 wixlcm.ko v1.2 起，**背光自动唤醒 + 10 秒无按键自动熄灭** 已内置
+ *     在驱动中，本程序不再自行管理背光开关或按键唤醒；
+ *   - 帧缓存比对仍保留（画面相同则不下发），减少 I/O；
+ *   - 启动时亮一次背光让用户看到初始画面，之后内核自动处理；
+ *   - 如需改节能超时，insmod 时传 auto_off_ms=<毫秒>。
  *
- * 系统：Debian 13。直接通过 ioctl 操作 /dev/lcm 与 /dev/wixbtn，
- * 不依赖任何第三方库。
+ * 系统：Debian 13。直接通过 ioctl 操作 /dev/lcm，不依赖任何第三方库。
  *
  * 编译：make            运行：sudo ./screen_ip_storage
  */
@@ -60,10 +61,12 @@
 
 #define ZPOOL_CMD       "/sbin/zpool"
 #define REFRESH_INTERVAL  5      /* 画面刷新间隔（秒） */
-#define IDLE_OFF_SECONDS 10     /* 连续多少秒无变化关背光（按任意键恢复） */
+/* IDLE_OFF_SECONDS —— v1.2 起已由内核驱动 wixlcm.ko 内置自动背光管理，
+ * 本程序不再自行管理背光。如需改节能超时，insmod 时设 auto_off_ms=<毫秒>。 */
 
 #define LCM_DEVICE      "/dev/lcm"
-#define BTN_DEVICE      "/dev/wixbtn"
+/* BTN_DEVICE —— 本程序不再打开按键设备，按键 → 背光 的唤醒逻辑
+ * 已由 wixlcm.ko v1.2 在内核中完成，不依赖用户态读 /dev/wixbtn。 */
 
 /* ---- 屏幕几何 ---- */
 #define SCREEN_W 128
@@ -304,7 +307,7 @@ static void render_frame(const struct panel_status *st, uint8_t *fb)
 }
 
 /* =======================================================================
- * /dev/lcm、/dev/wixbtn 操作
+ * /dev/lcm 操作
  * ======================================================================= */
 static int lcm_display_cmd(int fd, int cmd)
 {
@@ -335,45 +338,15 @@ static int lcm_write_frame(int fd, const uint8_t *fb)
 	return 0;
 }
 
-/* 等待一个刷新周期；期间按键可读则返回按键码，超时返回 0 */
-static int wait_for_key_or_timeout(int btn_fd, int seconds)
-{
-	fd_set rfds;
-	struct timeval tv;
-	int key = 0;
-
-	if (btn_fd < 0) {
-		sleep(seconds);
-		return 0;
-	}
-
-	FD_ZERO(&rfds);
-	FD_SET(btn_fd, &rfds);
-	tv.tv_sec = seconds;
-	tv.tv_usec = 0;
-
-	if (select(btn_fd + 1, &rfds, NULL, NULL, &tv) > 0) {
-		int code;
-
-		if (read(btn_fd, &code, sizeof(code)) == (ssize_t)sizeof(code))
-			key = code;
-	}
-	return key;
-}
-
 /* =======================================================================
  * main
  * ======================================================================= */
 int main(void)
 {
-	int lcd_fd, btn_fd = -1;
+	int lcd_fd;
 	uint8_t frame[FRAME_SIZE];
 	uint8_t last_frame[FRAME_SIZE];
 	int have_last = 0;
-	int unchanged = 0;
-	int backlight_on = 1;
-	const int idle_cycles = IDLE_OFF_SECONDS / REFRESH_INTERVAL > 0 ?
-		IDLE_OFF_SECONDS / REFRESH_INTERVAL : 1;
 
 	signal(SIGINT, on_sigint);
 	signal(SIGTERM, on_sigint);
@@ -385,21 +358,19 @@ int main(void)
 		return 1;
 	}
 
-	btn_fd = open(BTN_DEVICE, O_RDWR);
-	if (btn_fd < 0)
-		fprintf(stderr, "提示：未打开 %s，按键唤醒功能不可用\n", BTN_DEVICE);
-
+	/* 启动时亮一次背光，让用户立刻看到初始画面；
+	 * 之后完全交给内核驱动 v1.2 管理（按键自动亮 / 10s 后自动灭）。 */
 	lcm_set_backlight(lcd_fd, WIX_LCM_BL_ON);
 	lcm_display_cmd(lcd_fd, WIX_LCM_IOC_PON);
 
-	printf("状态屏启动(C)：%s/%s，存储 %s；每 %d 秒刷新，画面 %d 秒无变化关背光，"
-	       "按任意键点亮维持 %d 秒，Ctrl-C 退出\n",
-	       IP1DEV, IP2DEV, STORAGE_SHOWNAME,
-	       REFRESH_INTERVAL, IDLE_OFF_SECONDS, IDLE_OFF_SECONDS);
+	printf("状态屏启动(C)：%s/%s，存储 %s；每 %d 秒刷新，"
+	       "背光节能由内核自动管理（默认按键后 10 秒无后续即熄灭），"
+	       "Ctrl-C 退出\n",
+	       IP1DEV, IP2DEV, STORAGE_SHOWNAME, REFRESH_INTERVAL);
 
 	while (g_running) {
 		struct panel_status st;
-		int changed, key;
+		int changed;
 
 		collect_status(&st);
 		render_frame(&st, frame);
@@ -410,9 +381,6 @@ int main(void)
 				perror("write_frame");
 			memcpy(last_frame, frame, FRAME_SIZE);
 			have_last = 1;
-			unchanged = 0;
-		} else {
-			unchanged++;
 		}
 
 		printf("E1 %-15s [%s]   E2 %-15s [%s]   %s ALLOC/SIZE=%.1f%%\n",
@@ -423,29 +391,13 @@ int main(void)
 		       st.storage_name, st.usage * 100.0);
 		fflush(stdout);
 
-		if (!changed && backlight_on && unchanged >= idle_cycles) {
-			lcm_set_backlight(lcd_fd, WIX_LCM_BL_OFF);
-			backlight_on = 0;
-			printf("画面连续 %d 秒无变化，背光已关闭（按任意键点亮）\n",
-			       IDLE_OFF_SECONDS);
-		}
-
-		key = wait_for_key_or_timeout(btn_fd, REFRESH_INTERVAL);
-		if (key != 0) {
-			if (!backlight_on) {
-				lcm_set_backlight(lcd_fd, WIX_LCM_BL_ON);
-				backlight_on = 1;
-				printf("按键(%d)唤醒，背光已点亮\n", key);
-			}
-			unchanged = 0;	/* 重新计时，再维持 IDLE_OFF_SECONDS 秒 */
-		}
+		sleep(REFRESH_INTERVAL);
 	}
 
-	printf("\n退出，关闭背光与屏幕 ...\n");
+	printf("\n退出 ...\n");
+	/* cleanup：熄灭背光 + 关闭屏幕控制器（进程退出时的收尾） */
 	lcm_set_backlight(lcd_fd, WIX_LCM_BL_OFF);
 	lcm_display_cmd(lcd_fd, WIX_LCM_IOC_POFF);
-	if (btn_fd >= 0)
-		close(btn_fd);
 	close(lcd_fd);
 	return 0;
 }

@@ -339,7 +339,79 @@ sudo ./app
 
 ---
 
-## 6. 屏幕可以做的事（能力清单）
+## 6. v1.2 自动节能背光行为（内核驱动内置）
+
+从 v1.2 起，`wixlcm.ko` 自身管理背光的**自动唤醒 / 自动熄灭**逻辑，
+用户态程序通常**无需再自己实现"帧无变化 N 秒后关背光 / 按键唤醒"的节能循环**。
+
+### 6.1 默认行为
+
+| 时刻 | 驱动行为 |
+|---|---|
+| 模块加载 | 背光 **灭**（`initial_backlight=0`），面板控制器仍正常初始化 |
+| 任意物理键按下（Select / Scroll） | 背光自动点亮，并启动一个 **10 秒自动熄灭** 计时器 |
+| 10 秒内再次按键 | **重置** 10 秒计时器（取最后一次按键），不会被"卡住" |
+| 10 秒到期 | 背光自动熄灭，继续等待下一次按键 |
+| 用户态主动操作背光 | 自动熄灭计时器被**取消**，避免内核与用户态相互覆盖 |
+
+### 6.2 和用户态程序的协作方式
+
+- **完全不冲突**：用户态通过 `ioctl(WIX_LCM_IOC_BL_SET)`、
+  `/sys/class/misc/lcm/backlight`、或标准 `backlight class`
+  接口的**任何一次写入**，内核都会立刻 `cancel_delayed_work_sync`
+  取消内部的自动熄灭计时器。之后内核不再干涉背光状态，直到下一次
+  物理按键按下才重新进入"自动唤醒 + 自动熄灭"周期。
+- **用户态只想显示一次画面**：直接 `backlight_on()` 画完 `backlight_off()`，
+  内核的自动计时器被用户态的 BL_OFF 操作取消，下一次按键会重新亮屏。
+- **用户态想保持常亮**：循环里定时 `backlight_on()` 即可，内核计时器每次
+  被取消、每次按键又被重新 arm，不会出现"用户刚开屏内核又关掉"的打架。
+- **要完全关闭自动节能**：`insmod wixlcm.ko auto_off_on_keypress=0`
+  或 `auto_off_ms=0`；也可以把 `auto_off_ms` 设成一个大值。
+- **关键耦合：`enable_buttons=1` 是自动背光的前提**。按键检测定时器
+  `btn_poll_timer` 只在 `wix_buttons_init()` 里启动，而后者受
+  `enable_buttons` 模块参数控制。如果 `insmod wixlcm.ko enable_buttons=0`，
+  按键检测和自动背光会一起关闭——这是刻意的设计，没有按键输入
+  自然也无从谈"按键唤醒背光"。
+
+### 6.3 模块参数
+
+```sh
+insmod wixlcm.ko initial_backlight=1 auto_off_ms=5000 auto_off_on_keypress=1
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `initial_backlight` | `0` | 加载时背光状态 |
+| `enable_buttons` | `1` | 注册 `/dev/wixbtn` 按键设备；**自动背光也依赖此参数**——设 0 会同时关闭按键检测和自动唤醒 |
+| `auto_off_ms` | `10000` | 最后一次按键后多少毫秒自动熄灭（0 = 永不自动熄） |
+| `auto_off_on_keypress` | `1` | 物理按键是否自动点亮 + 重置计时；需要 `enable_buttons=1` 才有按键检测 |
+
+### 6.4 实现要点（给关心驱动行为的开发者）
+
+- 按键检测在 `btn_poll_timer`（定时器 softirq 上下文）里发现后
+  **只 schedule 一个 work_struct**，不直接碰背光——因为背光硬件
+  访问 `backlight_hw_set()` 要持 `sio_lock` mutex，而 softirq 里
+  不能持 mutex。实际的"点亮 + mod_delayed_work"在 workqueue
+  进程上下文 `bl_keypress_work_func` 里做。
+- 用户态 `backlight_set_state()` 内部先 `cancel_delayed_work_sync`
+  再写硬件；work 回调则反过来——**只写硬件、不走 backlight_set_state**，
+  避免自己 cancel 自己死锁。
+- 还有一个 `atomic_t bl_user_op_seq` 序号计数器，用来解决
+  "btn_poll_timer schedule_work 之后、work 还没执行时用户态已
+  经关掉背光"的竞态：work 执行时对比自己 schedule 时拍的快照
+  和当前计数器值，不一样就放弃这次"唤醒"。
+- **按键事件队列有深度上限 `BTN_EVENT_QUEUE_MAX=64`**（v1.2 新增）。
+  因为 v1.2 后用户态状态屏不再打开 `/dev/wixbtn`，但按键检测定时器
+  仍在 `enable_buttons=1` 时运行——如果不限长，每次按键都会 `kmalloc`
+  一个事件节点而没人读出来，就是内核内存泄漏。队满时新事件丢弃
+  （~1 KB 上限，远超正常交互量）。
+- `enable_buttons=1` 是自动背光的**硬依赖**：按键检测定时器
+  `btn_poll_timer` 只在 `wix_buttons_init()` 里启动，而后者在
+  `enable_buttons=0` 时跳过。关掉按键 = 关掉自动唤醒。
+
+---
+
+## 7. 屏幕可以做的事（能力清单）
 
 - **任意点阵内容**：文本、数字、IP / 主机名 / 时间 / 系统状态、小图标、
   几何图形、实心进度条、反白高亮行等——本质都是操作 1024 字节帧缓存。
@@ -349,9 +421,10 @@ sudo ./app
   三种途径任选。
 - **按键交互**：阻塞等待、非阻塞轮询、`select`/`poll` 超时多路等待、
   Python 回调线程；每按一下上报一个事件。
-- **节能状态屏范式**（参考实现已验证，可复用其思路）：缓存上一帧，
-  新帧逐字节相同则不下发；画面连续 N 秒无变化自动关背光；背光灭期间
-  显存照常更新，按任意键重新点亮并重置计时。
+- **节能状态屏范式**（参考实现已验证）：内核驱动 v1.2 已内置
+  按键自动唤醒 + 10 秒无后续按键自动熄灭，用户态只需帧缓存比对、
+  相同帧不下发即可（减少 I/O）。无需再写 `unchanged` 计数、
+  `wake_event` 回调、`backlight_on/off` 等节能循环代码。
 - **系统信息采集搭配**：Python 用标准库 / subprocess（如
   `zpool list -H -p -o alloc,size`、`SIOCGIFADDR` 取 IP、读
   `/sys/class/net/<if>/operstate`）；C 用 `socket+ioctl`、`popen`、
@@ -361,7 +434,7 @@ sudo ./app
 
 ---
 
-## 7. 参考文件速查
+## 8. 参考文件速查
 
 | 文件 | 内容 |
 |---|---|
@@ -374,7 +447,7 @@ sudo ./app
 | [screen_ip_storage_c/glyph.h](screen_ip_storage_c/glyph.h) | C 版 5×7 ASCII 点阵字库（含 `find_glyph`） |
 | [screen_ip_storage_c/lcm_uapi.h](screen_ip_storage_c/lcm_uapi.h) | 可供 C 新应用复制的 ABI 头文件副本 |
 
-## 8. 新应用开发落点（`some_idea/`）
+## 9. 新应用开发落点（`some_idea/`）
 
 - 新功能代码统一放在 `workspace/lcm_user/some_idea/` 下，Python 或 C
   任选，每个应用可建独立子目录。

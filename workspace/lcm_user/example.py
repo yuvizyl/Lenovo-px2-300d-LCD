@@ -33,6 +33,28 @@ px2lcm.py - LenovoEMC px2-300d 前面板【通用接口层】
             self.lcd.stripes()
     MyApp().run()        # Ctrl-C 退出，自动关闭设备
 
+# =======================================================================
+# v1.2 驱动自动背光管理（重要协作约定）
+# =======================================================================
+
+自 wixlcm.ko v1.2 起，内核驱动已内置背光节能：
+  - 模块加载后背光默认熄灭；
+  - 任意物理按键自动点亮背光，并启动一个 10 秒自动熄灭计时器；
+  - 连续按键：每次按键重置计时（取最后一次）；
+  - 10 秒到期自动熄灭，继续等待下一次按键。
+
+用户态与内核自动节能的协作规则：
+  - **不冲突**：本层任何一次背光操作（backlight_on/off/blink、
+    set_backlight）都会通过内核 `backlight_set_state` 入口处的
+    `cancel_delayed_work_sync` 立即取消自动熄灭计时器。之后内核
+    不再干涉背光，直到下一次物理按键才重新 arm。
+  - 用户态如果想保持内核自动节能的行为，**不要主动调用**
+    backlight_on/off——让内核自己处理即可。
+  - 用户态如果需要展示模式（保持常亮、闪灯等），照常调用即可，
+    但要知道这会暂时"抢回"控制权，直到下一次按键。
+  - screen_ip_storage.py 等状态屏应用已全部移交给内核管理，
+    自身不再实现按键唤醒 + 10 秒无变化关背光的循环。
+
 Python 2.7 / Python 3 通用，仅依赖标准库（fcntl/struct/threading）。
 """
 
@@ -133,6 +155,11 @@ class PX2LCM(object):
     """
     /dev/lcm 的薄封装：显示开关、背光三态、按页/整屏写显存。
     只做"把数据送进硬件"，不规定应用该显示什么。
+
+    v1.2 协作：backlight_on()/off()/blink()/set_backlight() 任何一次
+    调用都会取消内核驱动的自动熄灭计时器（下次物理按键才会重新 arm）。
+    如果想保持内核自动节能，就不要调这些方法——内核自己会在按键后亮、
+    10 秒无后续按键后熄。详见文件头注释。
     """
 
     WIDTH = COLUMN_COUNT
@@ -401,7 +428,10 @@ class FrontPanel(object):
         on_scroll()          Scroll 键（5）
         on_stop()            退出时（设备关闭前）调用一次
 
-    最小例子见 examples/demo_callback.py。
+    v1.2 提示：on_start() 里如果调 self.lcd.backlight_on()，会取消内核
+    的自动熄灭计时——这在"启动后需要持续亮屏展示初始画面"时是合理的。
+    后续背光节能交给内核即可，on_select/on_scroll 里通常不需要再调
+    backlight_on()（内核会自动在按键时点亮）。
     """
 
     def __init__(self, lcm_device="/dev/lcm", btn_device="/dev/wixbtn",

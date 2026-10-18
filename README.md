@@ -19,14 +19,14 @@ Python 库与示例程序，可直接驱动屏幕、背光和两个按键。
 ## 功能特性
 
 - **128×64 单色 LCM**：整屏 / 按页写入、任意点阵内容（ST7565 兼容控制器）
-- **LCD 背光**：亮 / 灭 / 硬件闪烁三态，支持 sysfs、标准 backlight class 与 ioctl
+- **LCD 背光**：亮 / 灭 / 硬件闪烁三态，支持 sysfs、标准 backlight class 与 ioctl；
+  **v1.2 内核级自动节能**：加载后背光默认熄灭，按任意物理键自动点亮并在 10 秒无后续按键后自动熄灭（每次按键重置计时）；用户态通过 ioctl / sysfs 主动操作会取消内核自动熄灭计时，避免冲突
 - **两个前面板按键**：Select、Scroll，内核 20ms 轮询 PCH GPIO 电平并软件去抖
   （避免 ACPI GPE 电平中断被风暴保护永久关闭），支持阻塞/非阻塞读取、
   `poll` 与 Python 回调
 - **动态加载**：单个 `.ko`，无需重编内核；在非 px2-300d 机器上会安全拒绝加载
 - **Python 接口层**：硬件能力与业务操作分离，内置 5×7 点阵字库与帧缓存
-- **节能状态屏示例**：IP / ZFS 容量显示、相同帧不刷新、10 秒无变化自动关背光、
-  按任意键唤醒（提供 Python 与 C 两个等价实现）
+- **节能状态屏示例**：IP / ZFS 容量显示、相同帧不刷新；背光自动节能（按键唤醒 + 10 秒后自动熄灭）已由内核驱动 v1.2 内置，用户态应用不再自行管理（提供 Python 与 C 两个等价实现）
 - 仅依赖 Linux 内核头文件与 Python 标准库（Python 2.7 / 3 通用库接口） 
 
 ## 硬件说明
@@ -66,11 +66,18 @@ px2_300d_lcd/
         └── some_idea/
             ├── screen_ip_storage/
             │   └── screen_ip_storage.py         IP / ZFS 状态屏（Python 实际应用）
-            └── screen_ip_storage_c/         同一状态屏的 C 语言实现
-                ├── screen_ip_storage.c
-                ├── glyph.h                  5x7 ASCII 点阵字库
+            ├── screen_ip_storage_c/         同一状态屏的 C 语言实现
+            │   ├── screen_ip_storage.c
+            │   ├── glyph.h                  5x7 ASCII 点阵字库
+            │   ├── lcm_uapi.h               ioctl 接口定义（副本）
+            │   └── Makefile
+            └── lcm_tcp_listener/            TCP JSON 点阵图监听器（C 语言三线程）
+                ├── lcm_tcp_listener.c       主程序（listener / display / watchdog）
+                ├── base64.c / base64.h      极简 base64 解码器（无第三方依赖）
+                ├── mincjson.c / mincjson.h  极简扁平 JSON 解析器
                 ├── lcm_uapi.h               ioctl 接口定义（副本）
-                └── Makefile
+                ├── Makefile
+                └── lcm_tcp_listener.md      协议说明与使用示例
 ```
 
 ## 快速开始
@@ -121,8 +128,11 @@ STORAGE_DEV = {"FS": "ZFS", "PoolName": "zfspool", "ShowName": "zfspool"}
 sudo python3 some_idea/screen_ip_storage.py
 ```
 
-界面（`E1/E2` 标签 + 网卡 IP + up 状态 + ZFS 池 ALLOC/SIZE 实心进度条），
-画面 10 秒无变化自动关背光，按任意键重新点亮。
+界面（`E1/E2` 标签 + 网卡 IP + up 状态 + ZFS 池 ALLOC/SIZE 实心进度条）。
+
+**节能说明（v1.2）**：背光自动唤醒 + 10 秒自动熄灭已完全由内核驱动
+内置管理，状态屏应用不再自行关/开背光。应用只负责每 5 秒采集→渲染→
+推送（帧相同则不下发），启动时亮一次背光让用户看到初始画面。
 
 同屏还有一个**功能完全等价的 C 语言版本**（直接 ioctl，无需 Python）：
 
@@ -133,7 +143,42 @@ sudo ./screen_ip_storage
 ```
 
 C 版同样在文件开头用宏定义 `IP1DEV / IP2DEV / STORAGE_FS / STORAGE_POOL /
-STORAGE_SHOWNAME / ZPOOL_CMD / REFRESH_INTERVAL / IDLE_OFF_SECONDS` 供修改。
+STORAGE_SHOWNAME / ZPOOL_CMD / REFRESH_INTERVAL` 供修改。
+（原 `IDLE_OFF_SECONDS` / `BTN_DEVICE` 宏自 v1.2 起已移除——背光节能改由
+内核驱动 `auto_off_ms` / `auto_off_on_keypress` 参数控制。）
+
+### 4. TCP JSON 点阵图监听器
+
+[lcm_tcp_listener/](workspace/lcm_user/some_idea/lcm_tcp_listener/) 是一个跑在
+px2-300d 上的 **TCP 服务**：监听指定 IP:端口（默认 `127.0.0.1:6776`），
+按行接收 JSON 消息，把其中 base64 编码的 1024 字节点阵图显示到屏幕上。
+
+- **三线程模型**：listener（socket accept + JSON 解析 + base64 解码）、
+  display（唯一操作 `/dev/lcm` 的线程，串行所有 ioctl）、
+  main 看门狗（每 2 秒检查线程存活，意外退出则重新拉起）。
+- **启动即打印 help**：无参数运行或 `-h` 都会输出使用说明并退出。
+- **可选参数**：`-b bind_ip`（默认 `127.0.0.1`，可设 `0.0.0.0` 对外）、
+  `-p port`（默认 `6776`）。
+- **零第三方依赖**：极简 base64 解码器 + 极简扁平 JSON 解析器均为手写。
+
+```sh
+cd workspace/lcm_user/some_idea/lcm_tcp_listener
+make
+sudo ./lcm_tcp_listener -b 0.0.0.0 -p 6776   # 对外监听
+sudo ./lcm_tcp_listener                      # 无参数 -> 打印 help
+```
+
+JSON 协议（每行一条）：
+
+```json
+{"frame":"<base64编码的1024字节点阵>"}     // 显示一帧
+{"clear":true}                              // 清屏
+{"backlight":0}                             // 只灭背光
+{"frame":"...","backlight":1}               // 同时显示 + 开背光
+```
+
+完整协议说明、发送示例（nc / Python）和内部线程协作细节见
+[lcm_tcp_listener.md](workspace/lcm_user/some_idea/lcm_tcp_listener/lcm_tcp_listener.md)。
 
 ## 编程模型
 
@@ -161,9 +206,11 @@ MyApp().run()                           # Ctrl-C 自动清理
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `sioaddr` | `0x4E` | Super-I/O 配置口地址 |
-| `initialize` | `1` | 加载时初始化并点亮面板 |
-| `initial_backlight` | `1` | 加载时背光状态：0=灭 / 1=亮 / 2=闪烁 |
-| `enable_buttons` | `1` | 注册 `/dev/wixbtn` 按键设备 |
+| `initialize` | `1` | 加载时初始化面板（ST7565 上电命令序列） |
+| `initial_backlight` | `0` | 加载时背光状态：0=灭 / 1=亮 / 2=闪烁 |
+| `enable_buttons` | `1` | 注册 `/dev/wixbtn` 按键设备；**v1.2 自动背光也依赖此参数**——按键检测定时器只在 `enable_buttons=1` 时启动，设为 0 会同时关闭自动唤醒 |
+| `auto_off_ms` | `10000` | 最后一次按键后背光自动熄灭的毫秒数（0 禁用自动熄灭） |
+| `auto_off_on_keypress` | `1` | 任意物理按键自动点亮背光并重置熄灭计时；**需要 `enable_buttons=1`** 才有按键检测 |
 | `wixdbg` | `0` | 打印详细寄存器 / GPIO / 背光 / 按键轮询调试信息 |
 
 ## 技术细节与原始资料

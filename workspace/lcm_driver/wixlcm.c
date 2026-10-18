@@ -76,6 +76,8 @@
 #include <linux/jiffies.h>
 #include <linux/version.h>
 #include <linux/acpi.h>
+#include <linux/workqueue.h>
+#include <linux/atomic.h>
 
 /* timer API renamed in kernel 6.15: del_timer_sync() -> timer_delete_sync() */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
@@ -90,7 +92,7 @@
 
 #include "lcm_uapi.h"
 
-#define WIXLCM_VERSION		"1.1"
+#define WIXLCM_VERSION		"1.2"
 #define LCM_DEVICE_NAME		"lcm"
 #define BTN_DEVICE_NAME		"wixbtn"
 #define SIO_ADDR_DEFAULT	0x4E
@@ -162,13 +164,21 @@ static bool initialize = true;
 module_param(initialize, bool, 0644);
 MODULE_PARM_DESC(initialize, "initialize and light up the panel on module load (default Y)");
 
-static int initial_backlight = WIX_LCM_BL_ON;
+static int initial_backlight = WIX_LCM_BL_OFF;
 module_param(initial_backlight, int, 0644);
-MODULE_PARM_DESC(initial_backlight, "backlight state after load: 0=off 1=on 2=blink (default 1)");
+MODULE_PARM_DESC(initial_backlight, "backlight state after load: 0=off 1=on 2=blink (default 0)");
 
 static bool enable_buttons = true;
 module_param(enable_buttons, bool, 0644);
 MODULE_PARM_DESC(enable_buttons, "register the two LCD buttons on /dev/wixbtn (default Y)");
+
+static unsigned auto_off_ms = 10000;
+module_param(auto_off_ms, uint, 0644);
+MODULE_PARM_DESC(auto_off_ms, "backlight auto-off delay after last keypress (ms, 0 to disable)");
+
+static bool auto_off_on_keypress = true;
+module_param(auto_off_on_keypress, bool, 0644);
+MODULE_PARM_DESC(auto_off_on_keypress, "wake backlight + reset auto-off timer on any keypress (default Y)");
 
 static int wixdbg;
 module_param(wixdbg, int, 0644);
@@ -436,6 +446,42 @@ static unsigned int hwm_idx_port;	/* LDN 0x0B base + 5 */
 static unsigned int hwm_data_port;	/* LDN 0x0B base + 6 */
 static int backlight_state = WIX_LCM_BL_OFF;
 static DEFINE_MUTEX(bl_lock);
+
+/*
+ * Auto backlight management (v1.2):
+ *
+ * On module load the backlight starts OFF (initial_backlight default 0).
+ * Any physical key press:
+ *   (1) turns the backlight ON (bl_keypress_work, process context so mutex OK)
+ *   (2) arms bl_autooff_dwork to turn it off after auto_off_ms (default 10s)
+ *       via mod_delayed_work — every new key press resets the timer because
+ *       mod_delayed_work replaces the existing expiry with a new one.
+ *
+ * Userspace vs. kernel cooperation:
+ *   - Every call to backlight_set_state() (ioctl / sysfs / backlight class)
+ *     first cancel_delayed_work_sync(&bl_autooff_dwork). This guarantees
+ *     the kernel auto-off cannot fight a deliberate userspace command.
+ *   - The next physical key press re-arms the cycle from scratch.
+ *   - backlight_hw_set() is the raw hardware accessor, also used from
+ *     wixlcm_exit()'s best-effort shutdown path.
+ *
+ * Race vs. userspace: a bl_keypress_work scheduled in btn_poll_timer's
+ * softirq context could "wake" the light *after* userspace has already
+ * turned it off. We solve this with an atomic sequence counter:
+ *   - userspace op -> atomic_inc(&bl_user_op_seq) inside backlight_set_state
+ *   - btn_poll_timer snapshots bl_user_op_seq and passes it into the
+ *     bl_keypress_work wrapper struct before schedule_work()
+ *   - bl_keypress_work_func compares its snapshot with the live counter
+ *     and bails out if they differ (userspace intervened in between).
+ */
+static struct delayed_work bl_autooff_dwork;
+static atomic_t bl_user_op_seq = ATOMIC_INIT(0);
+
+struct bl_keypress_data {
+	struct work_struct work;
+	unsigned int seq;	/* snapshot of bl_user_op_seq at schedule time */
+};
+static struct bl_keypress_data bl_keypress;
 #if IS_ENABLED(CONFIG_BACKLIGHT_CLASS_DEVICE)
 static struct backlight_device *wix_bl_dev;
 #endif
@@ -559,12 +605,88 @@ static int backlight_set_state(int state)
 	if (state < WIX_LCM_BL_OFF || state > WIX_LCM_BL_BLINK)
 		return -EINVAL;
 
+	/*
+	 * USERS <-> KERNEL COEXISTENCE (lock ordering is critical here).
+	 *
+	 * Any userspace path — ioctl / sysfs / backlight class — arrives
+	 * here. We must disarm the kernel auto-off so it cannot clobber
+	 * the deliberate userspace choice, and we must bump the user-op
+	 * seq counter so that a bl_keypress_work which was scheduled
+	 * before this call bails out before touching the hardware.
+	 *
+	 * CRITICAL: this cancel MUST run *before* we take bl_lock, because
+	 * bl_autooff_work_func (the delayed_work callback) also needs
+	 * bl_lock to update backlight_state. If we held bl_lock here
+	 * while waiting for the work to finish, the work would block
+	 * trying to acquire bl_lock, and we'd AB-BA deadlock. Running
+	 * the cancel with no locks taken keeps the lock ordering single-
+	 * threaded: backlight_set_state always does "cancel → bl_lock →
+	 * hw_set(sio_lock) → unlock".
+	 */
+	cancel_delayed_work_sync(&bl_autooff_dwork);
+	atomic_inc(&bl_user_op_seq);
+
 	mutex_lock(&bl_lock);
 	ret = backlight_hw_set(state);
 	if (ret == 0)
 		backlight_state = state;
 	mutex_unlock(&bl_lock);
 	return ret;
+}
+
+/* ======================================================================= */
+/* Auto-off / keypress-wake workqueue callbacks (v1.2)                      */
+/*                                                                         */
+/* Both run in process context so backlight_hw_set() (which takes sio_lock)*/
+/* is safe to call. They deliberately bypass backlight_set_state() because */
+/* that function does cancel_delayed_work_sync on entry — we would be      */
+/* cancelling ourselves.                                                   */
+/* ======================================================================= */
+
+/* Delayed_work callback: the auto-off timer expired, turn backlight off. */
+static void bl_autooff_work_func(struct work_struct *work)
+{
+	(void)work;
+
+	if (backlight_hw_set(WIX_LCM_BL_OFF) == 0) {
+		mutex_lock(&bl_lock);
+		backlight_state = WIX_LCM_BL_OFF;
+		mutex_unlock(&bl_lock);
+	}
+	lcm_dbg("auto-off: backlight -> OFF\n");
+}
+
+/* Work callback scheduled from btn_poll_timer when any physical key fires. */
+static void bl_keypress_work_func(struct work_struct *work)
+{
+	struct bl_keypress_data *k = container_of(work, struct bl_keypress_data, work);
+
+	if (!auto_off_on_keypress || auto_off_ms == 0)
+		return;
+
+	/*
+	 * Race guard: if userspace issued a backlight command between the
+	 * timer context that scheduled this work and now (process context
+	 * executing it), bl_user_op_seq will have advanced and we bail out.
+	 * Otherwise we would "wake" a light that userspace just turned off.
+	 */
+	if (k->seq != atomic_read(&bl_user_op_seq)) {
+		lcm_dbg("bl_keypress: user op intervened, skip wake\n");
+		return;
+	}
+
+	if (backlight_hw_set(WIX_LCM_BL_ON) == 0) {
+		mutex_lock(&bl_lock);
+		backlight_state = WIX_LCM_BL_ON;
+		mutex_unlock(&bl_lock);
+	}
+
+	/* mod_delayed_work — cancels any pending expiry first, then arms new one.
+	 * Every physical key press therefore resets the countdown to auto_off_ms. */
+	mod_delayed_work(system_wq, &bl_autooff_dwork,
+			 msecs_to_jiffies(auto_off_ms));
+
+	lcm_dbg("bl_keypress: backlight ON, auto-off in %u ms\n", auto_off_ms);
 }
 
 /* ======================================================================= */
@@ -823,6 +945,17 @@ struct wix_button {
 static LIST_HEAD(btn_events);
 static DEFINE_SPINLOCK(btn_event_lock);
 static DECLARE_WAIT_QUEUE_HEAD(btn_wait);
+/*
+ * Queue depth cap: if no userspace process is reading /dev/wixbtn (e.g.
+ * all apps switched to kernel v1.2 auto-backlight and closed the fd),
+ * btn_poll_timer still fires and enqueues every key press.  Without a cap
+ * this is an unbounded kmalloc leak.  64 events is ~1 KB — well under any
+ * reasonable memory budget and more than enough to never drop an event in
+ * normal interactive use (user polling loop, tight). Beyond the cap we drop
+ * the newest events rather than evicting the oldest — they are fresher.
+ */
+#define BTN_EVENT_QUEUE_MAX	64
+static atomic_t btn_event_count = ATOMIC_INIT(0);
 
 static unsigned int pch_gpio_base;
 static struct timer_list btn_timer;
@@ -852,8 +985,19 @@ static void btn_event_enqueue(int code)
 	}
 	node->code = code;
 
+	/* Queue depth cap inside the lock — no TOCTOU, and we only kmalloc
+	 * once we know we can actually append (avoid wasting an alloc on a
+	 * full queue, though 64 is generous enough that this matters rarely). */
 	spin_lock_irqsave(&btn_event_lock, flags);
+	if (atomic_read(&btn_event_count) >= BTN_EVENT_QUEUE_MAX) {
+		spin_unlock_irqrestore(&btn_event_lock, flags);
+		kfree(node);
+		pr_debug_ratelimited("wixlcm: button queue full (%d), dropping event %d\n",
+				     BTN_EVENT_QUEUE_MAX, code);
+		return;
+	}
 	list_add_tail(&node->list, &btn_events);
+	atomic_inc(&btn_event_count);
 	spin_unlock_irqrestore(&btn_event_lock, flags);
 
 	wake_up_interruptible(&btn_wait);
@@ -901,6 +1045,15 @@ static void btn_poll_timer(struct timer_list *unused)
 			btn_event_enqueue(b->code);
 			lcm_dbg("%s button pressed (polled GPIO%d)\n",
 				b->name, b->gpio_idx);
+
+			/* v1.2: schedule backlight wakeup. We run in timer
+			 * softirq context here — mutex + I/O ports are not
+			 * safe — so defer everything to a work_struct that
+			 * executes in process context. */
+			if (auto_off_on_keypress && auto_off_ms > 0) {
+				bl_keypress.seq = atomic_read(&bl_user_op_seq);
+				schedule_work(&bl_keypress.work);
+			}
 		}
 	}
 
@@ -934,6 +1087,7 @@ static int btn_event_pop(void)
 		list_del(&node->list);
 		code = node->code;
 		kfree(node);
+		atomic_dec(&btn_event_count);
 	}
 	spin_unlock_irqrestore(&btn_event_lock, flags);
 	return code;
@@ -1154,7 +1308,7 @@ static int __init wixlcm_init(void)
 
 	if (initial_backlight < WIX_LCM_BL_OFF ||
 	    initial_backlight > WIX_LCM_BL_BLINK)
-		initial_backlight = WIX_LCM_BL_ON;
+		initial_backlight = WIX_LCM_BL_OFF;
 
 	if (!request_region(sioaddr, 2, "wixlcm")) {
 		pr_warn("wixlcm: SIO ports 0x%X-0x%X already reserved, continuing anyway\n",
@@ -1181,9 +1335,19 @@ static int __init wixlcm_init(void)
 
 	device_create_file(lcmdev.this_device, &dev_attr_backlight);
 
-	/* backlight hardware + initial state (failure is non-fatal) */
+	/* v1.2: initialize auto-off / keypress-wake workqueue items
+	 * BEFORE touching any backlight state — backlight_set_state()
+	 * calls cancel_delayed_work_sync() on entry, and we must not
+	 * feed it an uninitialised delayed_work. */
+	INIT_WORK(&bl_keypress.work, bl_keypress_work_func);
+	INIT_DELAYED_WORK(&bl_autooff_dwork, bl_autooff_work_func);
+
+	/* backlight hardware + initial state (failure is non-fatal).
+	 * Use the raw accessor here — we do NOT want the userspace path
+	 * (backlight_set_state) incrementing bl_user_op_seq on load. */
 	if (backlight_hw_probe() == 0) {
-		backlight_set_state(initial_backlight);
+		if (backlight_hw_set(initial_backlight) == 0)
+			backlight_state = initial_backlight;
 
 #if IS_ENABLED(CONFIG_BACKLIGHT_CLASS_DEVICE)
 		{
@@ -1210,8 +1374,10 @@ static int __init wixlcm_init(void)
 	if (enable_buttons)
 		wix_buttons_init();
 
-	pr_info("wixlcm: px2-300d front panel driver v%s loaded (sio=0x%X, /dev/%s)\n",
-		WIXLCM_VERSION, sioaddr, LCM_DEVICE_NAME);
+	pr_info("wixlcm: px2-300d front panel driver v%s loaded (sio=0x%X, /dev/%s, "
+		"initial_bl=%d, auto_off=%ums)\n",
+		WIXLCM_VERSION, sioaddr, LCM_DEVICE_NAME,
+		initial_backlight, auto_off_ms);
 	return 0;
 
 err_release_region:
@@ -1224,6 +1390,14 @@ err_release_region:
 
 static void __exit wixlcm_exit(void)
 {
+	/* v1.2: drain the auto-off / keypress-wake workqueue first.
+	 * wix_buttons_exit() below calls wix_timer_delete_sync() on
+	 * btn_timer, so no new keypress events can fire after this point,
+	 * but any work that already sits on the queue must finish before
+	 * we tear down the misc devices and the backlight class device. */
+	cancel_delayed_work_sync(&bl_autooff_dwork);
+	cancel_work_sync(&bl_keypress.work);
+
 	wix_buttons_exit();
 
 #if IS_ENABLED(CONFIG_BACKLIGHT_CLASS_DEVICE)

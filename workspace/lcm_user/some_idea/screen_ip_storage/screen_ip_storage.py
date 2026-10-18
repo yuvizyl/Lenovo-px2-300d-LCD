@@ -11,15 +11,17 @@ screen_ip_storage.py - px2-300d 前面板 128x64 OLED 状态屏（对应照片�
     [########################          ]  <- 选中存储池 ALLOC/SIZE 的实心
                                               像素进度条（非 '#' 字符）
 
-节能策略：
-  - 缓存上一帧，新帧与上一帧完全相同则不下发（不刷新屏幕）；
-  - 连续 IDLE_OFF_SECONDS 秒画面无变化（默认 10 秒，即 2 个刷新周期）
-    后自动关闭背光；
-  - 背光关闭期间画面内容照常更新（显存照写），但只有按下 Select/Scroll
-    任意一键才重新点亮背光，并维持 IDLE_OFF_SECONDS 秒。
-本文件用函数实现：系统信息采集 -> 128x64 显存绘制 -> write_frame 下发。
+背光节能策略：
+  - 自 v1.2 起，**背光自动唤醒 + 10 秒无按键自动熄灭** 完全由内核驱动
+    wixlcm.ko 负责，本应用不再自行管理背光开关；
+  - 帧缓存比对仍保留（画面完全相同则不下发），减少 I/O；
+  - 内核在按键检测到后自动点亮背光并重置 10 秒计时，用户态无需
+    打开 /dev/wixbtn 或写任何背光控制代码；
+  - 若用户态需要主动控制背光（如展示演示模式），仍可调用
+    lcd.backlight_on()/off()——但这会取消内核的自动熄灭计时，
+    直到下一次物理按键才重新 arm。
 
-运行：sudo python3 screen_ip_storage.py        （需已 insmod wixlcm.ko）
+运行：sudo python3 screen_ip_storage.py        （需已 insmod wixlcm.ko v1.2+）
 退出：Ctrl-C
 """
 
@@ -29,12 +31,11 @@ import time
 import socket
 import struct
 import fcntl
-import threading
 import subprocess
 
 # 引用上一级目录中的通用接口 example.py（只它一个文件直接操作 /dev/lcm）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from example import PX2LCM, WixButtons, LCMError  # noqa: E402
+from example import PX2LCM, LCMError  # noqa: E402
 
 # =======================================================================
 # 用户可配置常量（按需修改）
@@ -47,7 +48,8 @@ STORAGE_DEV = {"FS": "ZFS", "PoolName": "zfspool", "ShowName": "zfspool"}
 
 ZPOOL_CMD = "/sbin/zpool"   # zpool 可执行文件位置
 REFRESH_INTERVAL = 5        # 画面刷新间隔（秒）
-IDLE_OFF_SECONDS = 10       # 画面连续多少秒无变化后关闭背光（按任意键恢复）
+# IDLE_OFF_SECONDS —— v1.2 起已由内核驱动 wixlcm.ko 内置自动背光管理，
+# 本应用不再自行管理背光。如需改节能超时，insmod 时设 auto_off_ms=<毫秒>。
 
 # ---- 屏幕几何（example 显存：8 页 x 128 列，每字节 8 个纵向像素）----
 SCREEN_W = 128
@@ -330,34 +332,9 @@ def render_frame(status):
 
 
 # =======================================================================
-# 主循环：定时采集 -> 渲染 -> 与上一帧比对 -> 变化才下发；
-#         连续无变化关背光，按键唤醒
+# 主循环：定时采集 -> 渲染 -> 帧缓存去重后下发；
+#         背光自动管理由内核驱动 wixlcm.ko 负责
 # =======================================================================
-def open_buttons():
-    """
-    打开 /dev/wixbtn 并启动按键监听（回调在 run_loop 里挂）。
-    设备不可用（驱动未开按键）时返回 None，屏幕其余功能不受影响。
-    """
-    try:
-        buttons = WixButtons()
-    except LCMError:
-        print("提示：未打开 /dev/wixbtn，按键唤醒功能不可用")
-        return None
-    buttons.start()
-    return buttons
-
-
-def push_frame(lcd, frame, last_frame):
-    """
-    帧缓存：与上一帧逐字节相同则不下发。
-    返回 (是否发生变化, 最新帧)。
-    """
-    if last_frame is not None and frame == last_frame:
-        return False, last_frame
-    lcd.write_frame(frame)
-    return True, frame
-
-
 def log_status(status):
     """在终端打印一行当前状态（与屏幕内容一致）。"""
     print("E1 %-15s [%s]   E2 %-15s [%s]   %s ALLOC/SIZE=%.1f%%"
@@ -370,52 +347,31 @@ def log_status(status):
     sys.stdout.flush()
 
 
-def run_loop(lcd, buttons):
-    """主事件循环，直到 Ctrl-C。"""
-    # 10 秒 / 5 秒 = 连续 2 个刷新周期无变化即关背光
-    idle_cycles = max(1, int(round(IDLE_OFF_SECONDS /
-                                   float(REFRESH_INTERVAL))))
-    wake_event = threading.Event()
-    if buttons is not None:
-        buttons.callback = lambda code: wake_event.set()
+def run_loop(lcd):
+    """主事件循环，直到 Ctrl-C。
+
+    每 REFRESH_INTERVAL 秒采集一次系统状态，渲染到显存，
+    与上一帧比对——逐字节相同则跳过下发以减少 I/O。
+    背光的自动唤醒 / 10 秒后自动熄灭由内核驱动 v1.2 内置管理，
+    本函数不再调用任何 backlight_on/off。
+    """
+    print("状态屏启动：%s/%s，存储 %s；每 %d 秒刷新，"
+          "背光节能由内核自动管理（默认按键后 10 秒无后续即熄灭），"
+          "Ctrl-C 退出"
+          % (IP1DEV, IP2DEV, STORAGE_DEV.get("ShowName", ""),
+             REFRESH_INTERVAL))
 
     last_frame = None
-    unchanged = 0
-    backlight_on = True
-
-    print("状态屏启动：%s/%s，存储 %s；每 %d 秒刷新，画面 %d 秒无变化关背光，"
-          "按任意键点亮维持 %d 秒，Ctrl-C 退出"
-          % (IP1DEV, IP2DEV, STORAGE_DEV.get("ShowName", ""),
-             REFRESH_INTERVAL, IDLE_OFF_SECONDS, IDLE_OFF_SECONDS))
-
     while True:
-        # 在采集前清事件，按键发生在渲染/休眠期间都不会丢（都会置位）
-        wake_event.clear()
-
         status = collect_status()
         frame = render_frame(status)
-        changed, last_frame = push_frame(lcd, frame, last_frame)
-        if changed:
-            unchanged = 0
-        else:
-            unchanged += 1
+
+        if last_frame is None or frame != last_frame:
+            lcd.write_frame(frame)
+            last_frame = frame
 
         log_status(status)
-
-        # 连续 idle_cycles 个周期画面无变化 -> 关背光（只发一次灭指令）
-        if not changed and backlight_on and unchanged >= idle_cycles:
-            lcd.backlight_off()
-            backlight_on = False
-            print("画面连续 %d 秒无变化，背光已关闭（按任意键点亮）"
-                  % IDLE_OFF_SECONDS)
-
-        # 等待下一个刷新周期；期间任意按键立即唤醒
-        if wake_event.wait(REFRESH_INTERVAL):
-            if not backlight_on:
-                lcd.backlight_on()
-                backlight_on = True
-                print("按键唤醒，背光已点亮")
-            unchanged = 0   # 重新计时：再维持 IDLE_OFF_SECONDS 秒
+        time.sleep(REFRESH_INTERVAL)
 
 
 def main():
@@ -425,17 +381,17 @@ def main():
         print(exc)
         sys.exit(1)
 
-    buttons = open_buttons()
-
     try:
+        # 启动时亮一次背光，让用户立刻看到初始画面；
+        # 之后完全交给内核驱动 v1.2 管理（按键自动亮 / 10s 后自动灭）。
         lcd.backlight_on()
         lcd.display_on()
-        run_loop(lcd, buttons)
+        run_loop(lcd)
     except KeyboardInterrupt:
-        print("\n退出，关闭背光与屏幕 ...")
+        print("\n退出 ...")
     finally:
-        if buttons is not None:
-            buttons.stop()
+        # 应用进程退出时把背光熄灭，屏幕控制器也关掉——
+        # 这是 cleanup，不是节能循环的一部分。
         lcd.backlight_off()
         lcd.display_off()
         lcd.close()
